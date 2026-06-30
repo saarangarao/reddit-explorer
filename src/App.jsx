@@ -284,7 +284,7 @@ function Legend({ categories, counts, activeCategories, onToggle }) {
           </div>
         );
       })}
-      <p style={{ margin: "10px 0 0", fontSize: 10, color: "#CCC", lineHeight: 1.4 }}>
+      <p style={{ margin: "10px 0 0", fontSize: 10, color: "#000000", lineHeight: 1.4 }}>
         Click to filter
       </p>
     </div>
