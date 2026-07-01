@@ -1,10 +1,7 @@
-import { useState, useMemo, useRef } from "react";
+import { useState, useMemo, useRef, useEffect, useCallback } from "react";
 import * as d3 from "d3";
 
-// ---------------------------------------------------------------------------
-// DATA — swap comment when real data is ready
-// import postsData from "./posts_viz.json";
-// ---------------------------------------------------------------------------
+import postsData from "./posts_viz.json";
 
 const CATEGORIES = [
   "career","finances","logistics","relationships",
@@ -33,77 +30,11 @@ const CATEGORY_LABELS = {
   healthcare:"Healthcare", family:"Family",
 };
 
-// Real distribution from your corpus
 const CORPUS_COUNTS = {
   career:1195, finances:1155, logistics:332, relationships:221,
   culture:211, other:151, legal:141, housing:123,
   education:103, healthcare:88, family:83,
 };
-
-// ---------------------------------------------------------------------------
-// Proportional sampling: scale to [30, 200] preserving relative weight
-// ---------------------------------------------------------------------------
-function computeSampleCounts(corpusCounts, minSample=30, maxSample=200) {
-  const vals = Object.values(corpusCounts);
-  const cMin = Math.min(...vals);
-  const cMax = Math.max(...vals);
-  const span = cMax - cMin;
-  const result = {};
-  Object.entries(corpusCounts).forEach(([cat, n]) => {
-    result[cat] = Math.round(minSample + (maxSample - minSample) * (n - cMin) / span);
-  });
-  return result;
-}
-
-const SAMPLE_COUNTS = computeSampleCounts(CORPUS_COUNTS);
-
-// ---------------------------------------------------------------------------
-// Generate sample posts (replace with real data slice from posts_viz.json)
-// ---------------------------------------------------------------------------
-function generateSamplePosts() {
-  const TITLES = {
-    career:["Job offer in Bangalore vs staying in US","Salary expectations after R2I","Tech jobs in Hyderabad — realistic?","WFH for US company while in India","Finding a job before moving back","Career switch after returning","Startup ecosystem comparison","Notice period negotiation","Remote work from India","Job market reality check 2024"],
-    finances:["401k after moving to India","Tax implications of R2I","NRE vs NRO account guide","Transferring savings — best way?","DTAA and double taxation","Investment options after returning","ESPP and brokerage accounts as NRI","Roth IRA after returning","Credit score implications","Portfolio rebalancing before leaving"],
-    logistics:["OCI card process timeline","Moving pets to India","Shipping household goods","Indian driving license for returnees","Pre-departure checklist","Customs and import duties","Health insurance transition","Phone plan after returning","Packers and movers experience","Air freight vs sea freight"],
-    relationships:["Moving back for aging parents","Spouse reluctant to return","Kids adjustment after moving","Long distance while planning R2I","Making friends as a returnee","Social life after returning","Partner visa for non-Indian spouse","Dating after returning","Friend circle rebuild","In-laws and family dynamics"],
-    culture:["Reverse culture shock is real","Work culture differences","Missing US lifestyle","Indian cities vs US suburbs","Adjusting to Indian pace","Food and daily life","Traffic and commute reality","Noise levels adjustment","Power cuts and infrastructure","Shopping habits change"],
-    other:["General question for returnees","Random observation","Off topic discussion","Miscellaneous advice","Community meta post","AMA — returned 3 years ago","Weekly discussion thread","Poll — best city for returnees","Satire post","Rant about planning"],
-    legal:["FEMA compliance after returning","Property purchase as OCI","Bribery and corruption","Double taxation legal side","Legal documents to prepare","RBI regulations for returnees","Will and estate planning","Business registration after returning","Intellectual property concerns","Employment contract review"],
-    housing:["Buying vs renting in Bangalore","Best areas in Pune","Apartment hunting remotely","Gated communities worth it?","Housing costs reality check","Builder reputation research","Interior design after moving","Property registration process","Vastu and layout preferences","Neighbourhood comparison"],
-    education:["International schools in Hyderabad","Kids curriculum transition","CBSE vs ICSE vs IB","College admissions for returnees","Homeschooling options","University application process","School fees reality","Extracurriculars availability","Language barrier for kids","Sports and activities"],
-    healthcare:["Health insurance options","Air quality concerns in Delhi","Finding good doctors in Bangalore","Mental health support in India","Specialist availability","Medical records transfer","Vaccination requirements","Gym and fitness options","Dental care costs","Prescription medication access"],
-    family:["Moving back to support parents","Family of 4 returning","Kids born in US — OCI process","Split family arrangement","Elderly parent care","Joint family dynamics","Childcare options","School admission for young kids","Family finances planning","Grandparent relationship building"],
-  };
-  const posts = [];
-  Object.entries(SAMPLE_COUNTS).forEach(([cat, count]) => {
-    const titles = TITLES[cat] || ["Post about " + cat];
-    for (let i = 0; i < count; i++) {
-      const score    = Math.floor(Math.random() * 800) + 5;
-      const comments = Math.floor(Math.random() * 150) + 2;
-      const eng      = Math.log(1 + score) * Math.log(1 + comments);
-      posts.push({
-        id: `${cat}_${i}`,
-        title: titles[i % titles.length],
-        score, comments, category: cat, engagement: eng,
-        post_asks: [
-          "How should I approach this situation when returning to India?",
-          "Has anyone navigated this successfully and what did you learn?",
-        ],
-        post_responses: [
-          "Consult a CA who specialises in NRI matters before making any financial moves.",
-          "Use the RNOR status window — it gives you a meaningful tax advantage in the first 2-3 years.",
-          "Retain your US accounts for 6-12 months to keep flexibility during the transition.",
-        ],
-        thread: `POST TITLE:\n${titles[i % titles.length]}\n\nPOST BODY:\nThe original poster shares their background and situation, asking the r/returnToIndia community for advice based on their experiences.\n\nCOMMENTS (sorted by score, highest first):\n[Comment 1]\nA detailed response from a community member with direct experience sharing practical advice.\n---\n[Comment 2]\nAnother perspective noting that individual circumstances vary and recommending professional guidance for specific situations.`,
-      });
-    }
-  });
-  // Normalize radii within [3, 14]
-  const engs = posts.map(p => p.engagement);
-  const eMin = Math.min(...engs), eMax = Math.max(...engs), span = eMax - eMin || 1;
-  posts.forEach(p => { p.radius = 3 + 11 * (p.engagement - eMin) / span; });
-  return posts;
-}
 
 // ---------------------------------------------------------------------------
 // Pack layout — static, computed once
@@ -113,39 +44,49 @@ function computeLayout(posts, outerR) {
   CATEGORIES.forEach(cat => { byCategory[cat] = []; });
   posts.forEach(p => { if (byCategory[p.category]) byCategory[p.category].push(p); });
 
-  // Pack each category cluster using d3.packSiblings
-  const clusterNodes = CATEGORIES.map(cat => {
-    const catPosts = byCategory[cat];
-    const circles  = catPosts.map(p => ({ r: p.radius, post: p }));
-    const packed   = d3.packSiblings(circles);
-    // Enclosing circle for the cluster
-    const enclosing = d3.packEnclose(packed);
-    // Add padding
-    const pad = 8;
-    return {
+  const root = {
+    children: CATEGORIES.map(cat => ({
       cat,
-      circles: packed,
-      r: enclosing.r + pad,
-      x: 0, y: 0,
+      children: byCategory[cat].map(p => ({ post: p, r: p.radius, value: p.radius * p.radius })),
+    })),
+  };
+
+  const pack = d3.pack()
+    .size([outerR * 2, outerR * 2])
+    .padding(2);
+
+  const hierarchy = d3.hierarchy(root)
+    .sum(d => d.value || 0)
+    .sort((a, b) => b.value - a.value);
+
+  pack(hierarchy);
+
+  const offsetX = outerR;
+  const offsetY = outerR;
+
+  const clusters = {};
+  CATEGORIES.forEach(cat => { clusters[cat] = []; });
+
+  hierarchy.leaves().forEach(leaf => {
+    const cat = leaf.parent.data.cat;
+    clusters[cat].push({
+      x: leaf.x - offsetX,
+      y: leaf.y - offsetY,
+      r: leaf.r,
+      post: leaf.data.post,
+    });
+  });
+
+  const centroids = {};
+  Object.entries(clusters).forEach(([cat, circles]) => {
+    if (!circles.length) return;
+    centroids[cat] = {
+      x: circles.reduce((s, c) => s + c.x, 0) / circles.length,
+      y: circles.reduce((s, c) => s + c.y, 0) / circles.length,
     };
   });
 
-  // Pack clusters inside outer circle
-  const outerNode = {
-    children: clusterNodes.map(n => ({ r: n.r, data: n })),
-    r: outerR,
-  };
-
-  const packed = d3.packSiblings(outerNode.children.map(n => ({ r: n.r, data: n.data })));
-  const enclosing = d3.packEnclose(packed);
-  const scale = outerR / (enclosing.r + 10);
-
-  packed.forEach((node, i) => {
-    clusterNodes[i].x = node.x * scale;
-    clusterNodes[i].y = node.y * scale;
-  });
-
-  return clusterNodes;
+  return { clusters, centroids };
 }
 
 // ---------------------------------------------------------------------------
@@ -307,7 +248,7 @@ function Legend({ sortedCats, counts, activeCategories, onToggle }) {
           </div>
         );
       })}
-      <p style={{ margin:"9px 0 0", fontSize:10, color:"#CCC", lineHeight:1.4 }}>Click to filter</p>
+      <p style={{ margin:"9px 0 0", fontSize:15, color:"#000000", lineHeight:1.4 }}>Click to filter</p>
     </div>
   );
 }
@@ -316,11 +257,24 @@ function Legend({ sortedCats, counts, activeCategories, onToggle }) {
 // Main
 // ---------------------------------------------------------------------------
 export default function Explorer() {
-  const posts = useMemo(() => generateSamplePosts(), []);
+  const posts = useMemo(() => {
+    const engs = postsData.map(p => p.engagement);
+    const eMin = Math.min(...engs);
+    const eMax = Math.max(...engs);
+    const span = eMax - eMin || 1;
+    return postsData.map(p => ({
+      ...p,
+      radius: 2.5 + 7 * (p.engagement - eMin) / span,
+    }));
+  }, []);
 
   const [selectedPost, setSelectedPost] = useState(null);
   const [tooltip, setTooltip]           = useState(null);
   const [activeCategories, setActiveCategories] = useState(new Set(CATEGORIES));
+
+  const svgRef   = useRef(null);
+  const gRef     = useRef(null);
+  const zoomRef  = useRef(null);
 
   const counts = useMemo(() => {
     const c = {};
@@ -340,15 +294,71 @@ export default function Explorer() {
     });
   };
 
-  // Responsive outer radius — fits inside viewport with margin
   const VW = window.innerWidth;
   const VH = window.innerHeight;
   const outerR = Math.min(VW, VH) * 0.44;
   const cx = VW / 2;
   const cy = VH / 2;
 
-  // Compute static layout once
-  const clusters = useMemo(() => computeLayout(posts, outerR), [posts, outerR]);
+  const { clusters, centroids } = useMemo(
+    () => computeLayout(posts, outerR),
+    [posts, outerR]
+  );
+
+  // ---------------------------------------------------------------------------
+  // D3 zoom — set up once after mount
+  // ---------------------------------------------------------------------------
+  useEffect(() => {
+    if (!svgRef.current || !gRef.current) return;
+
+    const svg = d3.select(svgRef.current);
+    const g   = d3.select(gRef.current);
+
+    const zoom = d3.zoom()
+      .scaleExtent([0.4, 10])
+      .on("zoom", (event) => {
+        g.attr("transform", event.transform);
+      });
+
+    svg.call(zoom);
+    zoomRef.current = zoom;
+
+    return () => svg.on(".zoom", null);
+  }, []);
+
+  // ---------------------------------------------------------------------------
+  // Zoom to category
+  // ---------------------------------------------------------------------------
+  const zoomToCategory = useCallback((cat) => {
+    if (!svgRef.current || !zoomRef.current) return;
+    const catCircles = clusters[cat];
+    if (!catCircles?.length) return;
+
+    const xs = catCircles.map(c => cx + c.x);
+    const ys = catCircles.map(c => cy + c.y);
+    const x0 = Math.min(...xs) - 50;
+    const x1 = Math.max(...xs) + 50;
+    const y0 = Math.min(...ys) - 50;
+    const y1 = Math.max(...ys) + 50;
+
+    const scale = Math.min(10, 0.88 / Math.max((x1 - x0) / VW, (y1 - y0) / VH));
+    const tx    = VW / 2 - scale * (x0 + x1) / 2;
+    const ty    = VH / 2 - scale * (y0 + y1) / 2;
+
+    d3.select(svgRef.current)
+      .transition().duration(600)
+      .call(zoomRef.current.transform, d3.zoomIdentity.translate(tx, ty).scale(scale));
+  }, [clusters, cx, cy, VW, VH]);
+
+  // ---------------------------------------------------------------------------
+  // Reset zoom
+  // ---------------------------------------------------------------------------
+  const resetZoom = useCallback(() => {
+    if (!svgRef.current || !zoomRef.current) return;
+    d3.select(svgRef.current)
+      .transition().duration(400)
+      .call(zoomRef.current.transform, d3.zoomIdentity);
+  }, []);
 
   return (
     <div style={{ width:"100vw", height:"100vh", background:"#F7F6F3", overflow:"hidden", position:"relative" }}>
@@ -367,82 +377,105 @@ export default function Explorer() {
         </span>
       </div>
 
-      {/* SVG map */}
-      <svg width={VW} height={VH} style={{ display:"block" }}
-        onClick={e => { if (e.target.tagName === "svg" || e.target.tagName === "circle" && !e.target.__data__) setSelectedPost(null); }}
+      {/* Reset view button */}
+      <button
+        onClick={resetZoom}
+        style={{
+          position:"fixed", top:16, right:28,
+          background:"none", border:"1px solid #E0DDD8",
+          borderRadius:6, padding:"5px 12px",
+          fontSize:11, color:"#AAA", cursor:"pointer",
+          fontFamily:"Inter,sans-serif", zIndex:50,
+          transition:"border-color 0.15s, color 0.15s",
+        }}
+        onMouseEnter={e => { e.target.style.color="#1A1A1A"; e.target.style.borderColor="#BBB"; }}
+        onMouseLeave={e => { e.target.style.color="#AAA"; e.target.style.borderColor="#E0DDD8"; }}
       >
-        {/* Outer boundary circle */}
-        <circle
-          cx={cx} cy={cy} r={outerR}
-          fill="none" stroke="#E0DDD8" strokeWidth={1}
-        />
+        Reset view
+      </button>
 
-        {/* Category clusters */}
-        {clusters.map(cluster => {
-          if (!activeCategories.has(cluster.cat)) return null;
-          const color = CATEGORY_COLORS[cluster.cat] || CATEGORY_COLORS.other;
-          return (
-            <g key={cluster.cat} transform={`translate(${cx + cluster.x}, ${cy + cluster.y})`}>
-              {cluster.circles.map((c, i) => (
-                <circle
-                  key={i}
-                  cx={c.x} cy={c.y} r={c.r}
-                  fill={color} fillOpacity={0.7}
-                  stroke={color} strokeWidth={0.5} strokeOpacity={0.3}
-                  style={{ cursor:"pointer" }}
-                  onMouseEnter={e => {
-                    e.target.setAttribute("fill-opacity","0.92");
-                    setTooltip({ post: c.post, x: e.clientX, y: e.clientY });
-                  }}
-                  onMouseMove={e => setTooltip(prev => prev ? { ...prev, x:e.clientX, y:e.clientY } : null)}
-                  onMouseLeave={e => {
-                    e.target.setAttribute("fill-opacity","0.7");
-                    setTooltip(null);
-                  }}
-                  onClick={e => {
-                    e.stopPropagation();
-                    setSelectedPost(c.post);
-                    setTooltip(null);
-                  }}
-                />
-              ))}
-              {/* Category label at cluster centroid */}
-              <text
-                x={0} y={0}
-                textAnchor="middle" dominantBaseline="central"
-                fill={color} fillOpacity={0.5}
-                fontSize={9} fontFamily="Inter,sans-serif"
-                fontWeight={600} letterSpacing="0.1em"
-                pointerEvents="none"
-              >
-                {CATEGORY_LABELS[cluster.cat].toUpperCase()}
-              </text>
-            </g>
-          );
-        })}
+      {/* SVG map */}
+      <svg
+        ref={svgRef}
+        width={VW} height={VH}
+        style={{ display:"block", cursor:"grab" }}
+        onClick={e => { if (e.target.tagName === "svg") setSelectedPost(null); }}
+      >
+        {/* Zoomable group — all map content lives here */}
+        <g ref={gRef}>
 
-        {/* Dimmed overlay for inactive categories */}
-        {clusters.map(cluster => {
-          if (activeCategories.has(cluster.cat)) return null;
-          return (
-            <g key={`dim-${cluster.cat}`} transform={`translate(${cx + cluster.x}, ${cy + cluster.y})`}>
-              {cluster.circles.map((c, i) => (
-                <circle
-                  key={i}
-                  cx={c.x} cy={c.y} r={c.r}
-                  fill={CATEGORY_COLORS[cluster.cat]} fillOpacity={0.08}
-                  stroke="none"
-                />
-              ))}
-            </g>
-          );
-        })}
+          {/* Outer boundary circle */}
+          <circle
+            cx={cx} cy={cy} r={outerR}
+            fill="none" stroke="#E0DDD8" strokeWidth={1}
+          />
+
+          {/* Category clusters */}
+          {CATEGORIES.map(cat => {
+            const color    = CATEGORY_COLORS[cat] || CATEGORY_COLORS.other;
+            const circles  = clusters[cat] || [];
+            const centroid = centroids[cat];
+            if (!circles.length) return null;
+
+            return (
+              <g key={cat} transform={`translate(${cx}, ${cy})`}>
+                {circles.map((c, i) => (
+                  <circle
+                    key={i}
+                    cx={c.x} cy={c.y} r={c.r}
+                    fill={color}
+                    fillOpacity={activeCategories.has(cat) ? 0.7 : 0.08}
+                    stroke={color}
+                    strokeWidth={0.5}
+                    strokeOpacity={activeCategories.has(cat) ? 0.3 : 0}
+                    style={{ cursor: activeCategories.has(cat) ? "pointer" : "default" }}
+                    onMouseEnter={e => {
+                      if (!activeCategories.has(cat)) return;
+                      e.target.setAttribute("fill-opacity", "0.92");
+                      setTooltip({ post: c.post, x: e.clientX, y: e.clientY });
+                    }}
+                    onMouseMove={e => setTooltip(prev => prev ? { ...prev, x: e.clientX, y: e.clientY } : null)}
+                    onMouseLeave={e => {
+                      e.target.setAttribute("fill-opacity", activeCategories.has(cat) ? "0.7" : "0.08");
+                      setTooltip(null);
+                    }}
+                    onClick={e => {
+                      if (!activeCategories.has(cat)) return;
+                      e.stopPropagation();
+                      setSelectedPost(c.post);
+                      setTooltip(null);
+                    }}
+                  />
+                ))}
+                {centroid && (
+                  <text
+                    x={centroid.x} y={centroid.y}
+                    textAnchor="middle" dominantBaseline="central"
+                    fill="#000000"
+                    fillOpacity={activeCategories.has(cat) ? 0.8 : 0.1}
+                    fontSize={9} fontFamily="Inter,sans-serif"
+                    fontWeight={600} letterSpacing="0.1em"
+                    pointerEvents="all"
+                    style={{ cursor: "zoom-in" }}
+                    onClick={e => {
+                      e.stopPropagation();
+                      zoomToCategory(cat);
+                    }}
+                  >
+                    {CATEGORY_LABELS[cat].toUpperCase()}
+                  </text>
+                )}
+              </g>
+            );
+          })}
+
+        </g>
       </svg>
 
       {/* Legend */}
       <Legend
         sortedCats={sortedCats}
-        counts={SAMPLE_COUNTS}
+        counts={counts}
         activeCategories={activeCategories}
         onToggle={toggleCategory}
       />
