@@ -399,7 +399,7 @@ export default function Explorer() {
           r/returnToIndia
         </h1>
         <span style={{ fontSize:11, color:"#CCC", fontFamily:"Inter,sans-serif" }}>
-          {posts.length.toLocaleString()} posts · proportional sample · circle size = engagement
+          {posts.length.toLocaleString()} posts · circle size = engagement
         </span>
       </div>
 
