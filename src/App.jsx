@@ -218,37 +218,59 @@ function Tooltip({ post, x, y }) {
 }
 
 // ---------------------------------------------------------------------------
-// Legend
+// Legend — collapsible
 // ---------------------------------------------------------------------------
 function Legend({ sortedCats, counts, activeCategories, onToggle }) {
+  const [expanded, setExpanded] = useState(true);
+
   return (
     <div style={{
       position:"fixed", bottom:24, left:24,
       background:"#FAFAF8", border:"1px solid #E0DDD8",
       borderRadius:8, padding:"12px 14px",
-      fontFamily:"Inter,sans-serif", zIndex:50, minWidth:168,
+      fontFamily:"Inter,sans-serif", zIndex:50,
+      minWidth:168,
       boxShadow:"0 2px 10px rgba(0,0,0,0.05)",
+      transition:"all 0.2s ease",
     }}>
-      <p style={{ margin:"0 0 9px", fontSize:9, fontWeight:600, letterSpacing:"0.1em", textTransform:"uppercase", color:"#CCC" }}>
-        Categories
-      </p>
-      {sortedCats.map(cat => {
-        const active = activeCategories.has(cat);
-        return (
-          <div key={cat} onClick={() => onToggle(cat)} style={{
-            display:"flex", alignItems:"center", justifyContent:"space-between",
-            gap:7, marginBottom:5, cursor:"pointer",
-            opacity: active ? 1 : 0.28, transition:"opacity 0.15s",
-          }}>
-            <div style={{ display:"flex", alignItems:"center", gap:6 }}>
-              <span style={{ width:6, height:6, borderRadius:"50%", background:CATEGORY_COLORS[cat], flexShrink:0 }}/>
-              <span style={{ fontSize:11, color:"#2C2C2C" }}>{CATEGORY_LABELS[cat]}</span>
-            </div>
-            <span style={{ fontSize:10, color:"#CCC" }}>{counts[cat]||0}</span>
-          </div>
-        );
-      })}
-      <p style={{ margin:"9px 0 0", fontSize:15, color:"#000000", lineHeight:1.4 }}>Click to filter</p>
+      {/* Header row — always visible */}
+      <div
+        onClick={() => setExpanded(prev => !prev)}
+        style={{
+          display:"flex", alignItems:"center", justifyContent:"space-between",
+          cursor:"pointer", marginBottom: expanded ? 9 : 0,
+        }}
+      >
+        <p style={{ margin:0, fontSize:9, fontWeight:600, letterSpacing:"0.1em", textTransform:"uppercase", color:"#CCC" }}>
+          Categories
+        </p>
+        <span style={{ fontSize:10, color:"#CCC", marginLeft:10, lineHeight:1 }}>
+          {expanded ? "▾" : "▸"}
+        </span>
+      </div>
+
+      {/* Collapsible body */}
+      {expanded && (
+        <>
+          {sortedCats.map(cat => {
+            const active = activeCategories.has(cat);
+            return (
+              <div key={cat} onClick={() => onToggle(cat)} style={{
+                display:"flex", alignItems:"center", justifyContent:"space-between",
+                gap:7, marginBottom:5, cursor:"pointer",
+                opacity: active ? 1 : 0.28, transition:"opacity 0.15s",
+              }}>
+                <div style={{ display:"flex", alignItems:"center", gap:6 }}>
+                  <span style={{ width:6, height:6, borderRadius:"50%", background:CATEGORY_COLORS[cat], flexShrink:0 }}/>
+                  <span style={{ fontSize:11, color:"#2C2C2C" }}>{CATEGORY_LABELS[cat]}</span>
+                </div>
+                <span style={{ fontSize:10, color:"#CCC" }}>{counts[cat]||0}</span>
+              </div>
+            );
+          })}
+          <p style={{ margin:"9px 0 0", fontSize:15, color:"#000000", lineHeight:1.4 }}>Click to filter</p>
+        </>
+      )}
     </div>
   );
 }
@@ -272,9 +294,9 @@ export default function Explorer() {
   const [tooltip, setTooltip]           = useState(null);
   const [activeCategories, setActiveCategories] = useState(new Set(CATEGORIES));
 
-  const svgRef   = useRef(null);
-  const gRef     = useRef(null);
-  const zoomRef  = useRef(null);
+  const svgRef  = useRef(null);
+  const gRef    = useRef(null);
+  const zoomRef = useRef(null);
 
   const counts = useMemo(() => {
     const c = {};
@@ -361,7 +383,11 @@ export default function Explorer() {
   }, []);
 
   return (
-    <div style={{ width:"100vw", height:"100vh", background:"#F7F6F3", overflow:"hidden", position:"relative" }}>
+    <div style={{
+      width:"100vw", height:"100vh",
+      background:"#F7F6F3",
+      overflow:"hidden", position:"relative",
+    }}>
 
       {/* Header */}
       <div style={{
@@ -388,8 +414,8 @@ export default function Explorer() {
           fontFamily:"Inter,sans-serif", zIndex:50,
           transition:"border-color 0.15s, color 0.15s",
         }}
-        onMouseEnter={e => { e.target.style.color="#1A1A1A"; e.target.style.borderColor="#BBB"; }}
-        onMouseLeave={e => { e.target.style.color="#AAA"; e.target.style.borderColor="#E0DDD8"; }}
+        onMouseEnter={e => { e.currentTarget.style.color="#1A1A1A"; e.currentTarget.style.borderColor="#BBB"; }}
+        onMouseLeave={e => { e.currentTarget.style.color="#AAA"; e.currentTarget.style.borderColor="#E0DDD8"; }}
       >
         Reset view
       </button>
@@ -401,7 +427,7 @@ export default function Explorer() {
         style={{ display:"block", cursor:"grab" }}
         onClick={e => { if (e.target.tagName === "svg") setSelectedPost(null); }}
       >
-        {/* Zoomable group — all map content lives here */}
+        {/* Zoomable group */}
         <g ref={gRef}>
 
           {/* Outer boundary circle */}
@@ -456,7 +482,7 @@ export default function Explorer() {
                     fontSize={9} fontFamily="Inter,sans-serif"
                     fontWeight={600} letterSpacing="0.1em"
                     pointerEvents="all"
-                    style={{ cursor: "zoom-in" }}
+                    style={{ cursor:"zoom-in" }}
                     onClick={e => {
                       e.stopPropagation();
                       zoomToCategory(cat);
