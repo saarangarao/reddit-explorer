@@ -37,6 +37,15 @@ const CORPUS_COUNTS = {
 };
 
 // ---------------------------------------------------------------------------
+// Keyword matching — searches title + thread text
+// ---------------------------------------------------------------------------
+function matchesSearch(post, keywords) {
+  if (!keywords.length) return true;
+  const haystack = `${post.title} ${post.thread}`.toLowerCase();
+  return keywords.every(kw => haystack.includes(kw));
+}
+
+// ---------------------------------------------------------------------------
 // Pack layout — static, computed once
 // ---------------------------------------------------------------------------
 function computeLayout(posts, outerR) {
@@ -90,11 +99,82 @@ function computeLayout(posts, outerR) {
 }
 
 // ---------------------------------------------------------------------------
+// Search bar
+// ---------------------------------------------------------------------------
+function SearchBar({ value, onChange, matchCount, searching }) {
+  return (
+    <div style={{
+      position:"fixed", top:14, left:"50%",
+      transform:"translateX(-50%)",
+      zIndex:50,
+      display:"flex", alignItems:"center", gap:8,
+    }}>
+      <div style={{
+        display:"flex", alignItems:"center",
+        background:"#FAFAF8", border:"1px solid #E0DDD8",
+        borderRadius:7, padding:"5px 12px",
+        boxShadow:"0 2px 10px rgba(0,0,0,0.05)",
+        gap:7,
+      }}>
+        <span style={{ fontSize:12, color:"#CCC", lineHeight:1 }}>⌕</span>
+        <input
+          type="text"
+          value={value}
+          onChange={e => onChange(e.target.value)}
+          placeholder="Search posts..."
+          style={{
+            border:"none", outline:"none",
+            background:"transparent",
+            fontSize:12, color:"#1A1A1A",
+            fontFamily:"Inter,sans-serif",
+            width:180,
+          }}
+        />
+        {value && (
+          <button
+            onClick={() => onChange("")}
+            style={{
+              background:"none", border:"none", cursor:"pointer",
+              fontSize:12, color:"#CCC", padding:0, lineHeight:1,
+            }}
+          >✕</button>
+        )}
+      </div>
+      {searching && (
+        <span style={{
+          fontSize:11, color:"#AAA",
+          fontFamily:"Inter,sans-serif",
+          background:"#FAFAF8",
+          border:"1px solid #E0DDD8",
+          borderRadius:6, padding:"5px 10px",
+          boxShadow:"0 2px 10px rgba(0,0,0,0.05)",
+          whiteSpace:"nowrap",
+        }}>
+          {matchCount} match{matchCount !== 1 ? "es" : ""}
+        </span>
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Thread panel
 // ---------------------------------------------------------------------------
-function ThreadPanel({ post, onClose }) {
+function ThreadPanel({ post, keywords, onClose }) {
   const [tab, setTab] = useState("thread");
   const color = CATEGORY_COLORS[post.category] || CATEGORY_COLORS.other;
+
+  // Highlight keywords in a string
+  function highlight(text) {
+    if (!keywords.length) return text;
+    const pattern = new RegExp(`(${keywords.map(k => k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join("|")})`, "gi");
+    const parts = text.split(pattern);
+    return parts.map((part, i) =>
+      pattern.test(part)
+        ? <mark key={i} style={{ background:"#FFF3B0", borderRadius:2, padding:"0 1px" }}>{part}</mark>
+        : part
+    );
+  }
 
   const threadBlocks = post.thread.split("\n---\n").map((block, i, arr) => (
     <div key={i} style={{ marginBottom:14, paddingBottom:14, borderBottom: i < arr.length-1 ? "1px solid #EDEBE6" : "none" }}>
@@ -110,7 +190,7 @@ function ThreadPanel({ post, onClose }) {
             fontFamily: isH ? "Inter,sans-serif" : "Georgia,serif",
             letterSpacing: isH ? "0.08em" : 0,
             textTransform: isH ? "uppercase" : "none",
-          }}>{line}</p>
+          }}>{isH ? line : highlight(line)}</p>
         );
       })}
     </div>
@@ -133,7 +213,7 @@ function ThreadPanel({ post, onClose }) {
           <button onClick={onClose} style={{ background:"none", border:"none", cursor:"pointer", fontSize:15, color:"#CCC", padding:0 }}>✕</button>
         </div>
         <h2 style={{ margin:"0 0 9px", fontSize:15, fontWeight:600, color:"#1A1A1A", lineHeight:1.4, fontFamily:"Georgia,serif" }}>
-          {post.title}
+          {highlight(post.title)}
         </h2>
         <div style={{ display:"flex", gap:14, fontSize:11, color:"#BBB", marginBottom:13 }}>
           <span>↑ {post.score.toLocaleString()}</span>
@@ -164,7 +244,7 @@ function ThreadPanel({ post, onClose }) {
                 {post.post_asks.map((ask, i) => (
                   <div key={i} style={{ display:"flex", gap:9, marginBottom:10, alignItems:"flex-start" }}>
                     <span style={{ width:4, height:4, borderRadius:"50%", background:color, flexShrink:0, marginTop:8 }}/>
-                    <p style={{ margin:0, fontSize:13, color:"#2C2C2C", lineHeight:1.65, fontFamily:"Georgia,serif" }}>{ask}</p>
+                    <p style={{ margin:0, fontSize:13, color:"#2C2C2C", lineHeight:1.65, fontFamily:"Georgia,serif" }}>{highlight(ask)}</p>
                   </div>
                 ))}
               </div>
@@ -175,7 +255,7 @@ function ThreadPanel({ post, onClose }) {
                 {post.post_responses.map((res, i) => (
                   <div key={i} style={{ display:"flex", gap:9, marginBottom:10, alignItems:"flex-start" }}>
                     <span style={{ width:4, height:4, borderRadius:"50%", background:color, flexShrink:0, marginTop:8 }}/>
-                    <p style={{ margin:0, fontSize:13, color:"#2C2C2C", lineHeight:1.65, fontFamily:"Georgia,serif" }}>{res}</p>
+                    <p style={{ margin:0, fontSize:13, color:"#2C2C2C", lineHeight:1.65, fontFamily:"Georgia,serif" }}>{highlight(res)}</p>
                   </div>
                 ))}
               </div>
@@ -233,7 +313,6 @@ function Legend({ sortedCats, counts, activeCategories, onToggle }) {
       boxShadow:"0 2px 10px rgba(0,0,0,0.05)",
       transition:"all 0.2s ease",
     }}>
-      {/* Header row — always visible */}
       <div
         onClick={() => setExpanded(prev => !prev)}
         style={{
@@ -249,7 +328,6 @@ function Legend({ sortedCats, counts, activeCategories, onToggle }) {
         </span>
       </div>
 
-      {/* Collapsible body */}
       {expanded && (
         <>
           {sortedCats.map(cat => {
@@ -290,9 +368,10 @@ export default function Explorer() {
     }));
   }, []);
 
-  const [selectedPost, setSelectedPost] = useState(null);
-  const [tooltip, setTooltip]           = useState(null);
+  const [selectedPost, setSelectedPost]         = useState(null);
+  const [tooltip, setTooltip]                   = useState(null);
   const [activeCategories, setActiveCategories] = useState(new Set(CATEGORIES));
+  const [searchQuery, setSearchQuery]           = useState("");
 
   const svgRef  = useRef(null);
   const gRef    = useRef(null);
@@ -307,6 +386,23 @@ export default function Explorer() {
   const sortedCats = useMemo(() =>
     [...CATEGORIES].sort((a,b) => (CORPUS_COUNTS[b]||0) - (CORPUS_COUNTS[a]||0)),
   []);
+
+  // Parse search query into individual keywords
+  const keywords = useMemo(() =>
+    searchQuery.trim().toLowerCase().split(/\s+/).filter(Boolean),
+  [searchQuery]);
+
+  const searching = keywords.length > 0;
+
+  // Set of matching post IDs when searching
+  const matchingIds = useMemo(() => {
+    if (!searching) return null;
+    const ids = new Set();
+    posts.forEach(p => { if (matchesSearch(p, keywords)) ids.add(p.id); });
+    return ids;
+  }, [posts, keywords, searching]);
+
+  const matchCount = matchingIds ? matchingIds.size : 0;
 
   const toggleCategory = (cat) => {
     setActiveCategories(prev => {
@@ -328,66 +424,56 @@ export default function Explorer() {
   );
 
   // ---------------------------------------------------------------------------
-  // D3 zoom — set up once after mount
+  // D3 zoom
   // ---------------------------------------------------------------------------
   useEffect(() => {
     if (!svgRef.current || !gRef.current) return;
-
     const svg = d3.select(svgRef.current);
     const g   = d3.select(gRef.current);
-
     const zoom = d3.zoom()
       .scaleExtent([0.4, 10])
-      .on("zoom", (event) => {
-        g.attr("transform", event.transform);
-      });
-
+      .on("zoom", (event) => { g.attr("transform", event.transform); });
     svg.call(zoom);
     zoomRef.current = zoom;
-
     return () => svg.on(".zoom", null);
   }, []);
 
-  // ---------------------------------------------------------------------------
-  // Zoom to category
-  // ---------------------------------------------------------------------------
   const zoomToCategory = useCallback((cat) => {
     if (!svgRef.current || !zoomRef.current) return;
     const catCircles = clusters[cat];
     if (!catCircles?.length) return;
-
     const xs = catCircles.map(c => cx + c.x);
     const ys = catCircles.map(c => cy + c.y);
-    const x0 = Math.min(...xs) - 50;
-    const x1 = Math.max(...xs) + 50;
-    const y0 = Math.min(...ys) - 50;
-    const y1 = Math.max(...ys) + 50;
-
-    const scale = Math.min(10, 0.88 / Math.max((x1 - x0) / VW, (y1 - y0) / VH));
-    const tx    = VW / 2 - scale * (x0 + x1) / 2;
-    const ty    = VH / 2 - scale * (y0 + y1) / 2;
-
-    d3.select(svgRef.current)
-      .transition().duration(600)
-      .call(zoomRef.current.transform, d3.zoomIdentity.translate(tx, ty).scale(scale));
+    const x0 = Math.min(...xs) - 50, x1 = Math.max(...xs) + 50;
+    const y0 = Math.min(...ys) - 50, y1 = Math.max(...ys) + 50;
+    const scale = Math.min(10, 0.88 / Math.max((x1-x0)/VW, (y1-y0)/VH));
+    const tx = VW/2 - scale*(x0+x1)/2;
+    const ty = VH/2 - scale*(y0+y1)/2;
+    d3.select(svgRef.current).transition().duration(600)
+      .call(zoomRef.current.transform, d3.zoomIdentity.translate(tx,ty).scale(scale));
   }, [clusters, cx, cy, VW, VH]);
 
-  // ---------------------------------------------------------------------------
-  // Reset zoom
-  // ---------------------------------------------------------------------------
   const resetZoom = useCallback(() => {
     if (!svgRef.current || !zoomRef.current) return;
-    d3.select(svgRef.current)
-      .transition().duration(400)
+    d3.select(svgRef.current).transition().duration(400)
       .call(zoomRef.current.transform, d3.zoomIdentity);
   }, []);
 
+  // ---------------------------------------------------------------------------
+  // Circle appearance helpers
+  // ---------------------------------------------------------------------------
+  function getCircleOpacity(cat, postId) {
+    const catActive = activeCategories.has(cat);
+    if (!catActive) return { fill: 0.08, stroke: 0 };
+    if (!searching)  return { fill: 0.7,  stroke: 0.3 };
+    const matches = matchingIds.has(postId);
+    return matches
+      ? { fill: 0.88, stroke: 0.6 }
+      : { fill: 0.06, stroke: 0 };
+  }
+
   return (
-    <div style={{
-      width:"100vw", height:"100vh",
-      background:"#F7F6F3",
-      overflow:"hidden", position:"relative",
-    }}>
+    <div style={{ width:"100vw", height:"100vh", background:"#F7F6F3", overflow:"hidden", position:"relative" }}>
 
       {/* Header */}
       <div style={{
@@ -399,9 +485,17 @@ export default function Explorer() {
           r/returnToIndia
         </h1>
         <span style={{ fontSize:11, color:"#CCC", fontFamily:"Inter,sans-serif" }}>
-          {posts.length.toLocaleString()} posts · circle size = engagement
+          {posts.length.toLocaleString()} posts · proportional sample · circle size = engagement
         </span>
       </div>
+
+      {/* Search bar — centered at top */}
+      <SearchBar
+        value={searchQuery}
+        onChange={setSearchQuery}
+        matchCount={matchCount}
+        searching={searching}
+      />
 
       {/* Reset view button */}
       <button
@@ -427,14 +521,9 @@ export default function Explorer() {
         style={{ display:"block", cursor:"grab" }}
         onClick={e => { if (e.target.tagName === "svg") setSelectedPost(null); }}
       >
-        {/* Zoomable group */}
         <g ref={gRef}>
-
           {/* Outer boundary circle */}
-          <circle
-            cx={cx} cy={cy} r={outerR}
-            fill="none" stroke="#E0DDD8" strokeWidth={1}
-          />
+          <circle cx={cx} cy={cy} r={outerR} fill="none" stroke="#E0DDD8" strokeWidth={1}/>
 
           {/* Category clusters */}
           {CATEGORIES.map(cat => {
@@ -445,34 +534,48 @@ export default function Explorer() {
 
             return (
               <g key={cat} transform={`translate(${cx}, ${cy})`}>
-                {circles.map((c, i) => (
-                  <circle
-                    key={i}
-                    cx={c.x} cy={c.y} r={c.r}
-                    fill={color}
-                    fillOpacity={activeCategories.has(cat) ? 0.7 : 0.08}
-                    stroke={color}
-                    strokeWidth={0.5}
-                    strokeOpacity={activeCategories.has(cat) ? 0.3 : 0}
-                    style={{ cursor: activeCategories.has(cat) ? "pointer" : "default" }}
-                    onMouseEnter={e => {
-                      if (!activeCategories.has(cat)) return;
-                      e.target.setAttribute("fill-opacity", "0.92");
-                      setTooltip({ post: c.post, x: e.clientX, y: e.clientY });
-                    }}
-                    onMouseMove={e => setTooltip(prev => prev ? { ...prev, x: e.clientX, y: e.clientY } : null)}
-                    onMouseLeave={e => {
-                      e.target.setAttribute("fill-opacity", activeCategories.has(cat) ? "0.7" : "0.08");
-                      setTooltip(null);
-                    }}
-                    onClick={e => {
-                      if (!activeCategories.has(cat)) return;
-                      e.stopPropagation();
-                      setSelectedPost(c.post);
-                      setTooltip(null);
-                    }}
-                  />
-                ))}
+                {circles.map((c, i) => {
+                  const { fill, stroke } = getCircleOpacity(cat, c.post.id);
+                  const isMatch = searching && matchingIds.has(c.post.id) && activeCategories.has(cat);
+
+                  return (
+                    <g key={i}>
+                      <circle
+                        cx={c.x} cy={c.y} r={c.r}
+                        fill={color} fillOpacity={fill}
+                        stroke={color} strokeWidth={0.5} strokeOpacity={stroke}
+                        style={{ cursor: activeCategories.has(cat) ? "pointer" : "default" }}
+                        onMouseEnter={e => {
+                          if (!activeCategories.has(cat)) return;
+                          e.target.setAttribute("fill-opacity", "0.95");
+                          setTooltip({ post: c.post, x: e.clientX, y: e.clientY });
+                        }}
+                        onMouseMove={e => setTooltip(prev => prev ? { ...prev, x: e.clientX, y: e.clientY } : null)}
+                        onMouseLeave={e => {
+                          e.target.setAttribute("fill-opacity", String(fill));
+                          setTooltip(null);
+                        }}
+                        onClick={e => {
+                          if (!activeCategories.has(cat)) return;
+                          e.stopPropagation();
+                          setSelectedPost(c.post);
+                          setTooltip(null);
+                        }}
+                      />
+                      {/* Match ring */}
+                      {isMatch && (
+                        <circle
+                          cx={c.x} cy={c.y} r={c.r + 1.5}
+                          fill="none"
+                          stroke={color} strokeWidth={1.5} strokeOpacity={0.9}
+                          pointerEvents="none"
+                        />
+                      )}
+                    </g>
+                  );
+                })}
+
+                {/* Category label */}
                 {centroid && (
                   <text
                     x={centroid.x} y={centroid.y}
@@ -483,10 +586,7 @@ export default function Explorer() {
                     fontWeight={600} letterSpacing="0.1em"
                     pointerEvents="all"
                     style={{ cursor:"zoom-in" }}
-                    onClick={e => {
-                      e.stopPropagation();
-                      zoomToCategory(cat);
-                    }}
+                    onClick={e => { e.stopPropagation(); zoomToCategory(cat); }}
                   >
                     {CATEGORY_LABELS[cat].toUpperCase()}
                   </text>
@@ -494,7 +594,6 @@ export default function Explorer() {
               </g>
             );
           })}
-
         </g>
       </svg>
 
@@ -509,9 +608,13 @@ export default function Explorer() {
       {/* Tooltip */}
       {tooltip && <Tooltip post={tooltip.post} x={tooltip.x} y={tooltip.y} />}
 
-      {/* Thread panel */}
+      {/* Thread panel — passes keywords for highlighting */}
       {selectedPost && (
-        <ThreadPanel post={selectedPost} onClose={() => setSelectedPost(null)} />
+        <ThreadPanel
+          post={selectedPost}
+          keywords={keywords}
+          onClose={() => setSelectedPost(null)}
+        />
       )}
     </div>
   );
