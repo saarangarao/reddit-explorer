@@ -158,13 +158,105 @@ function SearchBar({ value, onChange, matchCount, searching }) {
 }
 
 // ---------------------------------------------------------------------------
-// Thread panel
+// In-memory cache so re-opening an already-viewed thread doesn't re-fetch
+// ---------------------------------------------------------------------------
+const threadCache = new Map();
+
+// ---------------------------------------------------------------------------
+// Stats bar — localized reciprocity/bucket summary for this thread
+// ---------------------------------------------------------------------------
+function Stat({ label, value }) {
+  return (
+    <div style={{ display:"flex", flexDirection:"column" }}>
+      <span style={{ fontSize:8, textTransform:"uppercase", letterSpacing:"0.08em", color:"#CCC" }}>{label}</span>
+      <span style={{ fontSize:13, fontWeight:600, color:"#1A1A1A" }}>{value}</span>
+    </div>
+  );
+}
+
+function ThreadStats({ stats }) {
+  if (!stats) return (
+    <p style={{ fontSize:11, color:"#CCC", fontFamily:"Inter,sans-serif", margin:"0 0 14px" }}>
+      No user-to-user reply pairs in this thread.
+    </p>
+  );
+  return (
+    <div style={{
+      display:"flex", flexWrap:"wrap", gap:"10px 18px",
+      padding:"10px 0 14px", borderBottom:"1px solid #EDEBE6", marginBottom:16,
+    }}>
+      <Stat label="Pairs" value={stats.unique_pairs} />
+      <Stat label="Single-shot" value={stats.bucket_counts?.single_shot || 0} />
+      <Stat label="Repeat" value={stats.bucket_counts?.repeat_single_thread || 0} />
+      <Stat label="Mean reciprocity" value={stats.mean_reciprocity?.toFixed(2)} />
+      <Stat label="Fully reciprocal" value={stats.fully_reciprocal_count} />
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Recursive nested comment renderer
+// ---------------------------------------------------------------------------
+function CommentNode({ node, depth, color, highlight }) {
+  return (
+    <div style={{ marginLeft: depth * 16, marginBottom: 12 }}>
+      <div style={{ display:"flex", gap:8, alignItems:"center", marginBottom:3 }}>
+        <span style={{ fontSize:10, fontFamily:"monospace", color:"#999" }}>
+          {node.author_hash ? node.author_hash.slice(0, 8) : "unknown"}
+        </span>
+        <span style={{ fontSize:10, color:"#BBB" }}>↑{node.score}</span>
+      </div>
+      <p style={{ margin:"0 0 4px", fontSize:13, fontFamily:"Georgia,serif", color: node.removed ? "#CCC" : "#2C2C2C", lineHeight:1.6, fontStyle: node.removed ? "italic" : "normal" }}>
+        {node.removed ? "[deleted/removed]" : highlight(node.body || "")}
+      </p>
+      {node.children?.map(child => (
+        <CommentNode key={child.id} node={child} depth={depth + 1} color={color} highlight={highlight} />
+      ))}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Thread panel — fetches the full nested thread + stats for the selected post
 // ---------------------------------------------------------------------------
 function ThreadPanel({ post, keywords, onClose }) {
-  const [tab, setTab] = useState("thread");
+  const [threadData, setThreadData] = useState(null);
+  const [loading, setLoading]       = useState(true);
+  const [error, setError]           = useState(null);
   const color = CATEGORY_COLORS[post.category] || CATEGORY_COLORS.other;
 
-  // Highlight keywords in a string
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    setError(null);
+    setThreadData(null);
+
+    if (threadCache.has(post.id)) {
+      setThreadData(threadCache.get(post.id));
+      setLoading(false);
+      return;
+    }
+
+    fetch(`${import.meta.env.BASE_URL}threads/${post.id}.json`)
+      .then(res => {
+        if (!res.ok) throw new Error(`Failed to load thread (${res.status})`);
+        return res.json();
+      })
+      .then(data => {
+        if (cancelled) return;
+        threadCache.set(post.id, data);
+        setThreadData(data);
+        setLoading(false);
+      })
+      .catch(err => {
+        if (cancelled) return;
+        setError(err.message);
+        setLoading(false);
+      });
+
+    return () => { cancelled = true; };
+  }, [post.id]);
+
   function highlight(text) {
     if (!keywords.length) return text;
     const pattern = new RegExp(`(${keywords.map(k => k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join("|")})`, "gi");
@@ -175,26 +267,6 @@ function ThreadPanel({ post, keywords, onClose }) {
         : part
     );
   }
-
-  const threadBlocks = post.thread.split("\n---\n").map((block, i, arr) => (
-    <div key={i} style={{ marginBottom:14, paddingBottom:14, borderBottom: i < arr.length-1 ? "1px solid #EDEBE6" : "none" }}>
-      {block.split("\n").map((line, j) => {
-        if (!line.trim()) return <br key={j}/>;
-        const isH = /^(POST TITLE:|POST BODY:|COMMENTS|\[Comment \d+\])/.test(line.trim());
-        return (
-          <p key={j} style={{
-            margin:"2px 0", lineHeight:1.7,
-            fontSize: isH ? 10 : 13,
-            fontWeight: isH ? 600 : 400,
-            color: isH ? "#CCC" : "#2C2C2C",
-            fontFamily: isH ? "Inter,sans-serif" : "Georgia,serif",
-            letterSpacing: isH ? "0.08em" : 0,
-            textTransform: isH ? "uppercase" : "none",
-          }}>{isH ? line : highlight(line)}</p>
-        );
-      })}
-    </div>
-  ));
 
   return (
     <div style={{
@@ -219,48 +291,35 @@ function ThreadPanel({ post, keywords, onClose }) {
           <span>↑ {post.score.toLocaleString()}</span>
           <span>💬 {post.comments.toLocaleString()}</span>
         </div>
-        <div style={{ display:"flex" }}>
-          {["thread","summary"].map(t => (
-            <button key={t} onClick={() => setTab(t)} style={{
-              flex:1, padding:"8px 0",
-              background:"none", border:"none",
-              borderBottom: tab===t ? `2px solid ${color}` : "2px solid transparent",
-              cursor:"pointer", fontSize:11,
-              fontWeight: tab===t ? 600 : 400,
-              color: tab===t ? "#1A1A1A" : "#BBB",
-              transition:"all 0.15s", textTransform:"capitalize",
-            }}>{t}</button>
-          ))}
-        </div>
       </div>
       <div style={{ flex:1, overflowY:"auto", padding:"18px 22px" }}>
-        {tab === "thread" ? (
-          <div>{threadBlocks}</div>
-        ) : (
-          <div>
-            {post.post_asks?.length > 0 && (
-              <div style={{ marginBottom:24 }}>
-                <p style={{ fontSize:9, fontWeight:600, letterSpacing:"0.1em", textTransform:"uppercase", color:"#CCC", margin:"0 0 10px" }}>Post Asks</p>
-                {post.post_asks.map((ask, i) => (
-                  <div key={i} style={{ display:"flex", gap:9, marginBottom:10, alignItems:"flex-start" }}>
-                    <span style={{ width:4, height:4, borderRadius:"50%", background:color, flexShrink:0, marginTop:8 }}/>
-                    <p style={{ margin:0, fontSize:13, color:"#2C2C2C", lineHeight:1.65, fontFamily:"Georgia,serif" }}>{highlight(ask)}</p>
-                  </div>
+        {loading && (
+          <p style={{ fontSize:12, color:"#CCC", fontFamily:"Inter,sans-serif" }}>Loading thread...</p>
+        )}
+        {error && (
+          <p style={{ fontSize:12, color:"#C4645A", fontFamily:"Inter,sans-serif" }}>
+            Couldn't load this thread: {error}
+          </p>
+        )}
+        {threadData && (
+          <>
+            {threadData.post?.selftext && threadData.post.selftext.trim() && (
+              <div style={{ marginBottom:18, paddingBottom:16, borderBottom:"1px solid #EDEBE6" }}>
+                {threadData.post.selftext.split("\n").map((line, i) => (
+                  line.trim()
+                    ? <p key={i} style={{ margin:"0 0 6px", fontSize:13, fontFamily:"Georgia,serif", color:"#2C2C2C", lineHeight:1.7 }}>{highlight(line)}</p>
+                    : null
                 ))}
               </div>
             )}
-            {post.post_responses?.length > 0 && (
-              <div>
-                <p style={{ fontSize:9, fontWeight:600, letterSpacing:"0.1em", textTransform:"uppercase", color:"#CCC", margin:"0 0 10px" }}>Responses & Advice</p>
-                {post.post_responses.map((res, i) => (
-                  <div key={i} style={{ display:"flex", gap:9, marginBottom:10, alignItems:"flex-start" }}>
-                    <span style={{ width:4, height:4, borderRadius:"50%", background:color, flexShrink:0, marginTop:8 }}/>
-                    <p style={{ margin:0, fontSize:13, color:"#2C2C2C", lineHeight:1.65, fontFamily:"Georgia,serif" }}>{highlight(res)}</p>
-                  </div>
-                ))}
-              </div>
+            <ThreadStats stats={threadData.stats} />
+            {threadData.comments.length === 0 && (
+              <p style={{ fontSize:12, color:"#CCC" }}>No comments on this post.</p>
             )}
-          </div>
+            {threadData.comments.map(node => (
+              <CommentNode key={node.id} node={node} depth={0} color={color} highlight={highlight} />
+            ))}
+          </>
         )}
       </div>
     </div>
@@ -387,10 +446,21 @@ export default function Explorer() {
     [...CATEGORIES].sort((a,b) => (CORPUS_COUNTS[b]||0) - (CORPUS_COUNTS[a]||0)),
   []);
 
-  // Parse search query into individual keywords
-  const keywords = useMemo(() =>
-    searchQuery.trim().toLowerCase().split(/\s+/).filter(Boolean),
-  [searchQuery]);
+  // Parse search query into independent keyword-phrases.
+  // Accepts either "{burnt out, exhausted, overwhelmed}" or plain
+  // "burnt out, exhausted, overwhelmed" — braces are optional.
+  // Each comma-separated entry is kept intact as its own phrase (not
+  // split further on spaces), so multi-word terms match as whole units.
+  const keywords = useMemo(() => {
+    let raw = searchQuery.trim();
+    if (raw.startsWith("{") && raw.endsWith("}")) {
+      raw = raw.slice(1, -1);
+    }
+    return raw
+      .split(",")
+      .map(k => k.trim().toLowerCase())
+      .filter(Boolean);
+  }, [searchQuery]);
 
   const searching = keywords.length > 0;
 
