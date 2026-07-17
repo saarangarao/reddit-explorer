@@ -37,12 +37,17 @@ const CORPUS_COUNTS = {
 };
 
 // ---------------------------------------------------------------------------
-// Keyword matching — searches title + thread text
+// Keyword matching — scope is either 'post' (title + selftext only)
+// or 'thread' (title + full flattened thread text, including comments)
 // ---------------------------------------------------------------------------
-function matchesSearch(post, keywords) {
+function matchesSearch(post, keywords, scope, mode) {
   if (!keywords.length) return true;
-  const haystack = `${post.title} ${post.thread}`.toLowerCase();
-  return keywords.every(kw => haystack.includes(kw));
+  const haystack = scope === "post"
+    ? `${post.title} ${post.selftext || ""}`.toLowerCase()
+    : `${post.title} ${post.thread}`.toLowerCase();
+  return mode === "any"
+    ? keywords.some(kw => haystack.includes(kw))
+    : keywords.every(kw => haystack.includes(kw));
 }
 
 // ---------------------------------------------------------------------------
@@ -53,11 +58,17 @@ function computeLayout(posts, outerR) {
   CATEGORIES.forEach(cat => { byCategory[cat] = []; });
   posts.forEach(p => { if (byCategory[p.category]) byCategory[p.category].push(p); });
 
+  // d3.hierarchy() treats a node whose children accessor returns an empty
+  // array as a childless leaf (it never assigns `.children`), not as a
+  // pruned branch — so a category with 0 posts left after filtering must be
+  // left out of the tree entirely, or its "leaf" gets misread as a post.
   const root = {
-    children: CATEGORIES.map(cat => ({
-      cat,
-      children: byCategory[cat].map(p => ({ post: p, r: p.radius, value: p.radius * p.radius })),
-    })),
+    children: CATEGORIES
+      .filter(cat => byCategory[cat].length > 0)
+      .map(cat => ({
+        cat,
+        children: byCategory[cat].map(p => ({ post: p, r: p.radius, value: p.radius * p.radius })),
+      })),
   };
 
   const pack = d3.pack()
@@ -101,7 +112,7 @@ function computeLayout(posts, outerR) {
 // ---------------------------------------------------------------------------
 // Search bar
 // ---------------------------------------------------------------------------
-function SearchBar({ value, onChange, matchCount, searching }) {
+function SearchBar({ value, onChange, matchCount, searching, scope, onScopeChange, matchMode, onMatchModeChange, multiKeyword }) {
   return (
     <div style={{
       position:"fixed", top:14, left:"50%",
@@ -121,13 +132,13 @@ function SearchBar({ value, onChange, matchCount, searching }) {
           type="text"
           value={value}
           onChange={e => onChange(e.target.value)}
-          placeholder="Search posts..."
+          placeholder="{keyword one, keyword two, ...}"
           style={{
             border:"none", outline:"none",
             background:"transparent",
             fontSize:12, color:"#1A1A1A",
             fontFamily:"Inter,sans-serif",
-            width:180,
+            width:200,
           }}
         />
         {value && (
@@ -140,6 +151,59 @@ function SearchBar({ value, onChange, matchCount, searching }) {
           >✕</button>
         )}
       </div>
+
+      {/* Scope toggle: search post body only, or the full thread incl. comments */}
+      <div style={{
+        display:"flex", background:"#FAFAF8", border:"1px solid #E0DDD8",
+        borderRadius:7, overflow:"hidden",
+        boxShadow:"0 2px 10px rgba(0,0,0,0.05)",
+        fontFamily:"Inter,sans-serif",
+      }}>
+        {["post", "thread"].map(s => (
+          <button
+            key={s}
+            onClick={() => onScopeChange(s)}
+            style={{
+              padding:"5px 11px", fontSize:11, cursor:"pointer",
+              border:"none",
+              background: scope === s ? "#1A1A1A" : "transparent",
+              color: scope === s ? "#FAFAF8" : "#AAA",
+              fontWeight: scope === s ? 600 : 400,
+              transition:"all 0.15s",
+            }}
+          >
+            {s === "post" ? "Post Only" : "Full Thread"}
+          </button>
+        ))}
+      </div>
+
+      {/* ANY/ALL toggle: only meaningful with 2+ comma-separated keywords */}
+      {multiKeyword && (
+        <div style={{
+          display:"flex", background:"#FAFAF8", border:"1px solid #E0DDD8",
+          borderRadius:7, overflow:"hidden",
+          boxShadow:"0 2px 10px rgba(0,0,0,0.05)",
+          fontFamily:"Inter,sans-serif",
+        }}>
+          {["any", "all"].map(m => (
+            <button
+              key={m}
+              onClick={() => onMatchModeChange(m)}
+              style={{
+                padding:"5px 11px", fontSize:11, cursor:"pointer",
+                border:"none",
+                background: matchMode === m ? "#1A1A1A" : "transparent",
+                color: matchMode === m ? "#FAFAF8" : "#AAA",
+                fontWeight: matchMode === m ? 600 : 400,
+                transition:"all 0.15s",
+              }}
+            >
+              {m === "any" ? "Any" : "All"}
+            </button>
+          ))}
+        </div>
+      )}
+
       {searching && (
         <span style={{
           fontSize:11, color:"#AAA",
@@ -357,6 +421,44 @@ function Tooltip({ post, x, y }) {
 }
 
 // ---------------------------------------------------------------------------
+// Score slider — filters out posts below a minimum upvote count, independent
+// of category toggles and keyword search
+// ---------------------------------------------------------------------------
+function ScoreSlider({ sliderPos, onChange, minScore, visibleCount, totalCount }) {
+  return (
+    <div style={{
+      position:"fixed", bottom:24, right:24,
+      background:"#FAFAF8", border:"1px solid #E0DDD8",
+      borderRadius:8, padding:"12px 14px",
+      fontFamily:"Inter,sans-serif", zIndex:50,
+      minWidth:200,
+      boxShadow:"0 2px 10px rgba(0,0,0,0.05)",
+    }}>
+      <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:8 }}>
+        <p style={{ margin:0, fontSize:9, fontWeight:600, letterSpacing:"0.1em", textTransform:"uppercase", color:"#CCC" }}>
+          Min Upvotes
+        </p>
+        <span style={{ fontSize:11, color:"#2C2C2C", fontWeight:600 }}>
+          {minScore.toLocaleString()}+
+        </span>
+      </div>
+      <input
+        type="range"
+        min={0}
+        max={100}
+        step={1}
+        value={sliderPos}
+        onChange={e => onChange(Number(e.target.value))}
+        style={{ width:"100%", accentColor:"#1A1A1A", cursor:"pointer" }}
+      />
+      <p style={{ margin:"8px 0 0", fontSize:10, color:"#CCC" }}>
+        {visibleCount.toLocaleString()} / {totalCount.toLocaleString()} posts
+      </p>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Legend — collapsible
 // ---------------------------------------------------------------------------
 function Legend({ sortedCats, counts, activeCategories, onToggle }) {
@@ -416,7 +518,7 @@ function Legend({ sortedCats, counts, activeCategories, onToggle }) {
 // Main
 // ---------------------------------------------------------------------------
 export default function Explorer() {
-  const posts = useMemo(() => {
+  const allPosts = useMemo(() => {
     const engs = postsData.map(p => p.engagement);
     const eMin = Math.min(...engs);
     const eMax = Math.max(...engs);
@@ -431,6 +533,27 @@ export default function Explorer() {
   const [tooltip, setTooltip]                   = useState(null);
   const [activeCategories, setActiveCategories] = useState(new Set(CATEGORIES));
   const [searchQuery, setSearchQuery]           = useState("");
+  const [searchScope, setSearchScope]           = useState("thread"); // 'post' | 'thread'
+  const [matchMode, setMatchMode]               = useState("all"); // 'any' | 'all', for 2+ keywords
+  const [scoreSliderPos, setScoreSliderPos]     = useState(0); // 0-100, mapped to a score threshold below
+
+  // Slider position is mapped through a power curve (not linear) so that
+  // most of the slider's range gives fine control over the low/typical
+  // scores, since upvote counts are heavily right-skewed.
+  const maxScore = useMemo(() => Math.max(...allPosts.map(p => p.score)), [allPosts]);
+  const minScore = useMemo(() => {
+    if (scoreSliderPos <= 0) return 0;
+    const t = scoreSliderPos / 100;
+    return Math.round(Math.expm1(t * Math.log1p(maxScore)));
+  }, [scoreSliderPos, maxScore]);
+
+  // Base filter applied before anything else — every downstream toggle,
+  // search, and layout operates only on posts that clear this bar, so the
+  // slider works the same whether or not any other filter is active.
+  const posts = useMemo(
+    () => allPosts.filter(p => p.score >= minScore),
+    [allPosts, minScore]
+  );
 
   const svgRef  = useRef(null);
   const gRef    = useRef(null);
@@ -468,9 +591,9 @@ export default function Explorer() {
   const matchingIds = useMemo(() => {
     if (!searching) return null;
     const ids = new Set();
-    posts.forEach(p => { if (matchesSearch(p, keywords)) ids.add(p.id); });
+    posts.forEach(p => { if (matchesSearch(p, keywords, searchScope, matchMode)) ids.add(p.id); });
     return ids;
-  }, [posts, keywords, searching]);
+  }, [posts, keywords, searching, searchScope, matchMode]);
 
   const matchCount = matchingIds ? matchingIds.size : 0;
 
@@ -565,6 +688,11 @@ export default function Explorer() {
         onChange={setSearchQuery}
         matchCount={matchCount}
         searching={searching}
+        scope={searchScope}
+        onScopeChange={setSearchScope}
+        matchMode={matchMode}
+        onMatchModeChange={setMatchMode}
+        multiKeyword={keywords.length > 1}
       />
 
       {/* Reset view button */}
@@ -673,6 +801,15 @@ export default function Explorer() {
         counts={CORPUS_COUNTS}
         activeCategories={activeCategories}
         onToggle={toggleCategory}
+      />
+
+      {/* Score slider */}
+      <ScoreSlider
+        sliderPos={scoreSliderPos}
+        onChange={setScoreSliderPos}
+        minScore={minScore}
+        visibleCount={posts.length}
+        totalCount={allPosts.length}
       />
 
       {/* Tooltip */}
