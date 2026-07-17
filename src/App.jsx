@@ -37,6 +37,26 @@ const CORPUS_COUNTS = {
 };
 
 // ---------------------------------------------------------------------------
+// Second "slice of the cake": posts positioned by move_stage (pre/ambiguous/
+// post, left-to-right) and color-coded by post_type within each cluster.
+// ---------------------------------------------------------------------------
+const MOVE_STAGES = ["pre", "ambiguous", "post"];
+
+const MOVE_STAGE_LABELS = {
+  pre: "Pre-Move", ambiguous: "Ambiguous", post: "Post-Move",
+};
+
+const POST_TYPES = ["question", "rant", "other"];
+
+const POST_TYPE_COLORS = {
+  question: "#7A9BAF",
+  rant:     "#B8896E",
+  other:    "#A8A49E",
+};
+
+const POST_TYPE_LABELS = { question: "Question", rant: "Rant", other: "Other" };
+
+// ---------------------------------------------------------------------------
 // Keyword matching — scope is either 'post' (title + selftext only)
 // or 'thread' (title + full flattened thread text, including comments)
 // ---------------------------------------------------------------------------
@@ -110,6 +130,60 @@ function computeLayout(posts, outerR) {
 }
 
 // ---------------------------------------------------------------------------
+// Pack layout for the move-stage view — three independent packs (one per
+// stage), each confined to its own fixed-radius circle, rather than one
+// shared pack. That's what gives pre/ambiguous/post their fixed left-to-
+// right ordering, instead of leaving placement up to the pack algorithm.
+//
+// Within a stage, posts are nested one level deeper by post_type first —
+// same two-level hierarchy trick computeLayout() uses for categories — so
+// same-type posts pack next to each other instead of being scattered
+// throughout the stage circle by size alone.
+// ---------------------------------------------------------------------------
+function computeMoveStageLayout(posts, stageR) {
+  const byStage = {};
+  MOVE_STAGES.forEach(s => { byStage[s] = []; });
+  posts.forEach(p => { if (byStage[p.move_stage]) byStage[p.move_stage].push(p); });
+
+  const clusters = {};
+  MOVE_STAGES.forEach(stage => {
+    const stagePosts = byStage[stage];
+    if (!stagePosts.length) { clusters[stage] = []; return; }
+
+    const byType = {};
+    POST_TYPES.forEach(pt => { byType[pt] = []; });
+    stagePosts.forEach(p => { if (byType[p.post_type]) byType[p.post_type].push(p); });
+
+    // Same empty-children pitfall as computeLayout(): a post_type with 0
+    // posts in this stage must be left out of the tree entirely, or
+    // d3.hierarchy() misreads its childless node as a post leaf.
+    const root = {
+      children: POST_TYPES
+        .filter(pt => byType[pt].length > 0)
+        .map(pt => ({
+          ptype: pt,
+          children: byType[pt].map(p => ({ post: p, r: p.radius, value: p.radius * p.radius })),
+        })),
+    };
+
+    const pack = d3.pack().size([stageR * 2, stageR * 2]).padding(1.5);
+    const hierarchy = d3.hierarchy(root)
+      .sum(d => d.value || 0)
+      .sort((a, b) => b.value - a.value);
+    pack(hierarchy);
+
+    clusters[stage] = hierarchy.leaves().map(leaf => ({
+      x: leaf.x - stageR,
+      y: leaf.y - stageR,
+      r: leaf.r,
+      post: leaf.data.post,
+    }));
+  });
+
+  return clusters;
+}
+
+// ---------------------------------------------------------------------------
 // Search bar
 // ---------------------------------------------------------------------------
 function SearchBar({ value, onChange, matchCount, searching, scope, onScopeChange, matchMode, onMatchModeChange, multiKeyword }) {
@@ -132,7 +206,7 @@ function SearchBar({ value, onChange, matchCount, searching, scope, onScopeChang
           type="text"
           value={value}
           onChange={e => onChange(e.target.value)}
-          placeholder="{keyword one, keyword two, ...}"
+          placeholder="keyword one, keyword two, ..."
           style={{
             border:"none", outline:"none",
             background:"transparent",
@@ -226,6 +300,158 @@ function SearchBar({ value, onChange, matchCount, searching, scope, onScopeChang
 // ---------------------------------------------------------------------------
 const threadCache = new Map();
 
+async function fetchThreadData(postId) {
+  if (threadCache.has(postId)) return threadCache.get(postId);
+  const res = await fetch(`${import.meta.env.BASE_URL}threads/${postId}.json`);
+  if (!res.ok) throw new Error(`Failed to load thread ${postId} (${res.status})`);
+  const data = await res.json();
+  threadCache.set(postId, data);
+  return data;
+}
+
+// ---------------------------------------------------------------------------
+// Markdown dump — full threads of whatever's currently highlighted, ordered
+// by score, with a header describing exactly which filters produced the set.
+// ---------------------------------------------------------------------------
+async function mapWithConcurrency(items, limit, fn) {
+  const results = new Array(items.length);
+  let next = 0;
+  async function worker() {
+    while (next < items.length) {
+      const i = next++;
+      results[i] = await fn(items[i], i);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return results;
+}
+
+function mdEscapeHeading(text) {
+  return (text || "").replace(/\n/g, " ").trim();
+}
+
+function renderCommentMd(node, depth) {
+  const indent = "  ".repeat(depth);
+  const author = node.author_hash ? node.author_hash.slice(0, 8) : "unknown";
+  const bodyText = node.removed ? "*[deleted/removed]*" : (node.body || "").trim() || "*[empty]*";
+  const bodyIndented = bodyText.split("\n").join(`\n${indent}  `);
+  let out = `${indent}- **${author}** (↑${node.score}): ${bodyIndented}\n`;
+  (node.children || []).forEach(child => { out += renderCommentMd(child, depth + 1); });
+  return out;
+}
+
+function renderPostMd(index, post, threadData) {
+  const lines = [];
+  lines.push(`## ${index}. ${mdEscapeHeading(post.title)}`);
+  lines.push("");
+  lines.push(`- **Score:** ${post.score.toLocaleString()}  |  **Comments:** ${post.comments.toLocaleString()}`);
+  lines.push(`- **Category:** ${CATEGORY_LABELS[post.category] || post.category}  |  **Move stage:** ${MOVE_STAGE_LABELS[post.move_stage] || post.move_stage}  |  **Post type:** ${POST_TYPE_LABELS[post.post_type] || post.post_type}`);
+  lines.push(`- **Post ID:** ${post.id}`);
+  lines.push("");
+
+  const selftext = threadData?.post?.selftext;
+  if (selftext && selftext.trim()) {
+    lines.push(selftext.trim());
+    lines.push("");
+  }
+
+  const stats = threadData?.stats;
+  if (stats) {
+    lines.push(
+      `**Thread stats:** ${stats.unique_pairs} pairs · ` +
+      `${stats.bucket_counts?.single_shot || 0} single-shot · ` +
+      `${stats.bucket_counts?.repeat_single_thread || 0} repeat · ` +
+      `mean reciprocity ${stats.mean_reciprocity?.toFixed?.(2) ?? stats.mean_reciprocity} · ` +
+      `${stats.fully_reciprocal_count} fully reciprocal`
+    );
+    lines.push("");
+  }
+
+  const comments = threadData?.comments || [];
+  if (!comments.length) {
+    lines.push("*No comments on this post.*");
+  } else {
+    lines.push("### Comments");
+    lines.push("");
+    comments.forEach(c => { lines.push(renderCommentMd(c, 0)); });
+  }
+
+  lines.push("\n---\n");
+  return lines.join("\n");
+}
+
+function renderDumpHeader({ posts, viewMode, keywords, searchScope, matchMode, minScore, activeCategories, activePostTypes }) {
+  const lines = [];
+  lines.push(`# r/returnToIndia — Thread Dump`);
+  lines.push("");
+  lines.push(`- **Posts included:** ${posts.length.toLocaleString()}`);
+  lines.push(`- **Ordered by:** score (descending)`);
+  lines.push(`- **Classification view:** ${viewMode === "category" ? "By Category" : "By Move Stage"}`);
+
+  lines.push(keywords.length
+    ? `- **Keyword search:** {${keywords.join(", ")}} — match ${matchMode.toUpperCase()}, scope: ${searchScope === "post" ? "Post Only" : "Full Thread"}`
+    : `- **Keyword search:** none`);
+  lines.push(`- **Min upvotes:** ${minScore.toLocaleString()}+`);
+
+  if (viewMode === "category") {
+    const active = CATEGORIES.filter(c => activeCategories.has(c));
+    lines.push(`- **Active categories:** ${active.length === CATEGORIES.length ? "all" : active.map(c => CATEGORY_LABELS[c]).join(", ") || "none"}`);
+  } else {
+    const active = POST_TYPES.filter(t => activePostTypes.has(t));
+    lines.push(`- **Active post types:** ${active.length === POST_TYPES.length ? "all" : active.map(t => POST_TYPE_LABELS[t]).join(", ") || "none"}`);
+  }
+
+  const catCounts = {}, stageCounts = {}, typeCounts = {};
+  posts.forEach(p => {
+    catCounts[p.category]     = (catCounts[p.category]||0) + 1;
+    stageCounts[p.move_stage] = (stageCounts[p.move_stage]||0) + 1;
+    typeCounts[p.post_type]   = (typeCounts[p.post_type]||0) + 1;
+  });
+
+  lines.push("");
+  lines.push(`**Category breakdown:** ` + Object.entries(catCounts)
+    .sort((a, b) => b[1] - a[1])
+    .map(([k, v]) => `${CATEGORY_LABELS[k] || k}: ${v}`)
+    .join(", "));
+  lines.push(`**Move-stage breakdown:** ` + MOVE_STAGES.map(s => `${MOVE_STAGE_LABELS[s]}: ${stageCounts[s]||0}`).join(", "));
+  lines.push(`**Post-type breakdown:** ` + POST_TYPES.map(t => `${POST_TYPE_LABELS[t]}: ${typeCounts[t]||0}`).join(", "));
+  lines.push("");
+  lines.push("---");
+  lines.push("");
+  return lines.join("\n");
+}
+
+async function buildDumpMarkdown({ posts, viewMode, keywords, searchScope, matchMode, minScore, activeCategories, activePostTypes, onProgress }) {
+  const sorted = [...posts].sort((a, b) => b.score - a.score);
+  const header = renderDumpHeader({ posts: sorted, viewMode, keywords, searchScope, matchMode, minScore, activeCategories, activePostTypes });
+
+  let done = 0;
+  const total = sorted.length;
+  onProgress?.(0, total);
+
+  const threadDataList = await mapWithConcurrency(sorted, 10, async (post) => {
+    const data = await fetchThreadData(post.id);
+    done += 1;
+    onProgress?.(done, total);
+    return data;
+  });
+
+  const body = sorted.map((post, i) => renderPostMd(i + 1, post, threadDataList[i])).join("\n");
+  return header + body;
+}
+
+function downloadMarkdown(content, filename) {
+  const blob = new Blob([content], { type: "text/markdown;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
 // ---------------------------------------------------------------------------
 // Stats bar — localized reciprocity/bucket summary for this thread
 // ---------------------------------------------------------------------------
@@ -295,20 +521,9 @@ function ThreadPanel({ post, keywords, onClose }) {
     setError(null);
     setThreadData(null);
 
-    if (threadCache.has(post.id)) {
-      setThreadData(threadCache.get(post.id));
-      setLoading(false);
-      return;
-    }
-
-    fetch(`${import.meta.env.BASE_URL}threads/${post.id}.json`)
-      .then(res => {
-        if (!res.ok) throw new Error(`Failed to load thread (${res.status})`);
-        return res.json();
-      })
+    fetchThreadData(post.id)
       .then(data => {
         if (cancelled) return;
-        threadCache.set(post.id, data);
         setThreadData(data);
         setLoading(false);
       })
@@ -459,9 +674,10 @@ function ScoreSlider({ sliderPos, onChange, minScore, visibleCount, totalCount }
 }
 
 // ---------------------------------------------------------------------------
-// Legend — collapsible
+// Legend — collapsible. Generic over "items" so it can drive either the
+// category toggles or the post-type toggles depending on view mode.
 // ---------------------------------------------------------------------------
-function Legend({ sortedCats, counts, activeCategories, onToggle }) {
+function Legend({ title, items, activeKeys, onToggle }) {
   const [expanded, setExpanded] = useState(true);
 
   return (
@@ -482,7 +698,7 @@ function Legend({ sortedCats, counts, activeCategories, onToggle }) {
         }}
       >
         <p style={{ margin:0, fontSize:9, fontWeight:600, letterSpacing:"0.1em", textTransform:"uppercase", color:"#CCC" }}>
-          Categories
+          {title}
         </p>
         <span style={{ fontSize:10, color:"#CCC", marginLeft:10, lineHeight:1 }}>
           {expanded ? "▾" : "▸"}
@@ -491,19 +707,19 @@ function Legend({ sortedCats, counts, activeCategories, onToggle }) {
 
       {expanded && (
         <>
-          {sortedCats.map(cat => {
-            const active = activeCategories.has(cat);
+          {items.map(item => {
+            const active = activeKeys.has(item.key);
             return (
-              <div key={cat} onClick={() => onToggle(cat)} style={{
+              <div key={item.key} onClick={() => onToggle(item.key)} style={{
                 display:"flex", alignItems:"center", justifyContent:"space-between",
                 gap:7, marginBottom:5, cursor:"pointer",
                 opacity: active ? 1 : 0.28, transition:"opacity 0.15s",
               }}>
                 <div style={{ display:"flex", alignItems:"center", gap:6 }}>
-                  <span style={{ width:6, height:6, borderRadius:"50%", background:CATEGORY_COLORS[cat], flexShrink:0 }}/>
-                  <span style={{ fontSize:11, color:"#2C2C2C" }}>{CATEGORY_LABELS[cat]}</span>
+                  <span style={{ width:6, height:6, borderRadius:"50%", background:item.color, flexShrink:0 }}/>
+                  <span style={{ fontSize:11, color:"#2C2C2C" }}>{item.label}</span>
                 </div>
-                <span style={{ fontSize:10, color:"#CCC" }}>{counts[cat]||0}</span>
+                <span style={{ fontSize:10, color:"#CCC" }}>{item.count||0}</span>
               </div>
             );
           })}
@@ -511,6 +727,121 @@ function Legend({ sortedCats, counts, activeCategories, onToggle }) {
         </>
       )}
     </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// View mode toggle — switches between the category clustering and the
+// move-stage/post-type clustering
+// ---------------------------------------------------------------------------
+function ViewModeToggle({ mode, onChange }) {
+  return (
+    <div style={{
+      position:"fixed", top:46, left:28,
+      display:"flex", background:"#FAFAF8", border:"1px solid #E0DDD8",
+      borderRadius:7, overflow:"hidden",
+      boxShadow:"0 2px 10px rgba(0,0,0,0.05)",
+      fontFamily:"Inter,sans-serif", zIndex:50,
+    }}>
+      {[["category", "By Category"], ["move", "By Move Stage"]].map(([m, label]) => (
+        <button
+          key={m}
+          onClick={() => onChange(m)}
+          style={{
+            padding:"5px 11px", fontSize:11, cursor:"pointer",
+            border:"none",
+            background: mode === m ? "#1A1A1A" : "transparent",
+            color: mode === m ? "#FAFAF8" : "#AAA",
+            fontWeight: mode === m ? 600 : 400,
+            transition:"all 0.15s",
+          }}
+        >
+          {label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Dump button — exports full threads of whatever's currently highlighted as
+// markdown. Two-step: pressing it asks for confirmation (dumps can mean
+// fetching thousands of thread files) before actually running.
+// ---------------------------------------------------------------------------
+function DumpButton({ status, visibleCount, progress, error, onStart, onConfirm, onCancel }) {
+  const baseBtnStyle = {
+    background:"none", border:"1px solid #E0DDD8",
+    borderRadius:6, padding:"5px 12px",
+    fontSize:11, color:"#AAA", cursor:"pointer",
+    fontFamily:"Inter,sans-serif",
+    transition:"border-color 0.15s, color 0.15s",
+  };
+  const wrapStyle = {
+    position:"fixed", top:52, right:28, zIndex:50,
+    fontFamily:"Inter,sans-serif",
+  };
+
+  if (status === "confirm") {
+    return (
+      <div style={{
+        ...wrapStyle,
+        display:"flex", alignItems:"center", gap:6,
+        background:"#FAFAF8", border:"1px solid #E0DDD8",
+        borderRadius:7, padding:"6px 10px",
+        boxShadow:"0 2px 10px rgba(0,0,0,0.05)",
+      }}>
+        <span style={{ fontSize:11, color:"#2C2C2C" }}>
+          Export {visibleCount.toLocaleString()} thread{visibleCount !== 1 ? "s" : ""}?
+        </span>
+        <button onClick={onConfirm} style={{ ...baseBtnStyle, color:"#1A1A1A", fontWeight:600 }}>Confirm</button>
+        <button onClick={onCancel} style={baseBtnStyle}>Cancel</button>
+      </div>
+    );
+  }
+
+  if (status === "running") {
+    return (
+      <div style={{
+        ...wrapStyle,
+        background:"#FAFAF8", border:"1px solid #E0DDD8",
+        borderRadius:7, padding:"6px 12px",
+        boxShadow:"0 2px 10px rgba(0,0,0,0.05)",
+        fontSize:11, color:"#AAA",
+      }}>
+        Fetching threads… {progress.done}/{progress.total}
+      </div>
+    );
+  }
+
+  if (status === "error") {
+    return (
+      <div style={{
+        ...wrapStyle,
+        display:"flex", alignItems:"center", gap:6,
+        background:"#FAFAF8", border:"1px solid #C4645A",
+        borderRadius:7, padding:"6px 10px",
+        fontSize:11, color:"#C4645A",
+      }}>
+        <span>Dump failed: {error}</span>
+        <button onClick={onCancel} style={baseBtnStyle}>Dismiss</button>
+      </div>
+    );
+  }
+
+  return (
+    <button
+      onClick={onStart}
+      disabled={visibleCount === 0}
+      style={{
+        ...wrapStyle, ...baseBtnStyle,
+        opacity: visibleCount === 0 ? 0.4 : 1,
+        cursor: visibleCount === 0 ? "default" : "pointer",
+      }}
+      onMouseEnter={e => { if (visibleCount) { e.currentTarget.style.color="#1A1A1A"; e.currentTarget.style.borderColor="#BBB"; } }}
+      onMouseLeave={e => { e.currentTarget.style.color="#AAA"; e.currentTarget.style.borderColor="#E0DDD8"; }}
+    >
+      {status === "done" ? "Downloaded ✓" : `Dump ${visibleCount.toLocaleString()} thread${visibleCount !== 1 ? "s" : ""}`}
+    </button>
   );
 }
 
@@ -532,10 +863,15 @@ export default function Explorer() {
   const [selectedPost, setSelectedPost]         = useState(null);
   const [tooltip, setTooltip]                   = useState(null);
   const [activeCategories, setActiveCategories] = useState(new Set(CATEGORIES));
+  const [activePostTypes, setActivePostTypes]   = useState(new Set(POST_TYPES));
+  const [viewMode, setViewMode]                 = useState("category"); // 'category' | 'move'
   const [searchQuery, setSearchQuery]           = useState("");
   const [searchScope, setSearchScope]           = useState("thread"); // 'post' | 'thread'
-  const [matchMode, setMatchMode]               = useState("all"); // 'any' | 'all', for 2+ keywords
+  const [matchMode, setMatchMode]               = useState("any"); // 'any' | 'all', for 2+ keywords
   const [scoreSliderPos, setScoreSliderPos]     = useState(0); // 0-100, mapped to a score threshold below
+  const [dumpStatus, setDumpStatus]             = useState("idle"); // 'idle' | 'confirm' | 'running' | 'done' | 'error'
+  const [dumpProgress, setDumpProgress]         = useState({ done: 0, total: 0 });
+  const [dumpError, setDumpError]               = useState(null);
 
   // Slider position is mapped through a power curve (not linear) so that
   // most of the slider's range gives fine control over the low/typical
@@ -569,6 +905,14 @@ export default function Explorer() {
     [...CATEGORIES].sort((a,b) => (CORPUS_COUNTS[b]||0) - (CORPUS_COUNTS[a]||0)),
   []);
 
+  // Full-corpus counts for the post-type legend, same "unfiltered" semantics
+  // as CORPUS_COUNTS above (not affected by the score slider or search).
+  const postTypeCounts = useMemo(() => {
+    const c = {};
+    allPosts.forEach(p => { c[p.post_type] = (c[p.post_type]||0)+1; });
+    return c;
+  }, [allPosts]);
+
   // Parse search query into independent keyword-phrases.
   // Accepts either "{burnt out, exhausted, overwhelmed}" or plain
   // "burnt out, exhausted, overwhelmed" — braces are optional.
@@ -597,10 +941,54 @@ export default function Explorer() {
 
   const matchCount = matchingIds ? matchingIds.size : 0;
 
+  // "Currently highlighted" = whatever's drawn at full/matched opacity right
+  // now: passes the score floor, its category/post-type is toggled on, and
+  // (if searching) it's in the match set. This is what Dump exports.
+  const visiblePosts = useMemo(() => {
+    return posts.filter(p => {
+      const groupActive = viewMode === "category"
+        ? activeCategories.has(p.category)
+        : activePostTypes.has(p.post_type);
+      if (!groupActive) return false;
+      if (searching && !matchingIds.has(p.id)) return false;
+      return true;
+    });
+  }, [posts, viewMode, activeCategories, activePostTypes, searching, matchingIds]);
+
+  const startDump = () => setDumpStatus("confirm");
+  const cancelDump = () => { setDumpStatus("idle"); setDumpError(null); };
+
+  const confirmDump = async () => {
+    setDumpStatus("running");
+    setDumpProgress({ done: 0, total: visiblePosts.length });
+    try {
+      const markdown = await buildDumpMarkdown({
+        posts: visiblePosts,
+        viewMode, keywords, searchScope, matchMode, minScore,
+        activeCategories, activePostTypes,
+        onProgress: (done, total) => setDumpProgress({ done, total }),
+      });
+      downloadMarkdown(markdown, `returnToIndia-dump-${visiblePosts.length}-posts.md`);
+      setDumpStatus("done");
+      setTimeout(() => setDumpStatus(s => s === "done" ? "idle" : s), 2500);
+    } catch (err) {
+      setDumpError(err.message);
+      setDumpStatus("error");
+    }
+  };
+
   const toggleCategory = (cat) => {
     setActiveCategories(prev => {
       const next = new Set(prev);
       next.has(cat) ? next.delete(cat) : next.add(cat);
+      return next;
+    });
+  };
+
+  const togglePostType = (ptype) => {
+    setActivePostTypes(prev => {
+      const next = new Set(prev);
+      next.has(ptype) ? next.delete(ptype) : next.add(ptype);
       return next;
     });
   };
@@ -614,6 +1002,19 @@ export default function Explorer() {
   const { clusters, centroids } = useMemo(
     () => computeLayout(posts, outerR),
     [posts, outerR]
+  );
+
+  // Three fixed-position circles, left-to-right, one per move stage.
+  const stageR = Math.min(VW / 6, VH * 0.42) * 0.88;
+  const stageCenters = useMemo(() => {
+    const c = {};
+    MOVE_STAGES.forEach((stage, i) => { c[stage] = { x: VW * (i + 0.5) / 3, y: cy }; });
+    return c;
+  }, [VW, cy]);
+
+  const moveStageClusters = useMemo(
+    () => computeMoveStageLayout(posts, stageR),
+    [posts, stageR]
   );
 
   // ---------------------------------------------------------------------------
@@ -646,19 +1047,36 @@ export default function Explorer() {
       .call(zoomRef.current.transform, d3.zoomIdentity.translate(tx,ty).scale(scale));
   }, [clusters, cx, cy, VW, VH]);
 
+  const zoomToStage = useCallback((stage) => {
+    if (!svgRef.current || !zoomRef.current) return;
+    const center = stageCenters[stage];
+    if (!center) return;
+    const x0 = center.x - stageR - 30, x1 = center.x + stageR + 30;
+    const y0 = center.y - stageR - 30, y1 = center.y + stageR + 30;
+    const scale = Math.min(10, 0.88 / Math.max((x1-x0)/VW, (y1-y0)/VH));
+    const tx = VW/2 - scale*(x0+x1)/2;
+    const ty = VH/2 - scale*(y0+y1)/2;
+    d3.select(svgRef.current).transition().duration(600)
+      .call(zoomRef.current.transform, d3.zoomIdentity.translate(tx,ty).scale(scale));
+  }, [stageCenters, stageR, VW, VH]);
+
   const resetZoom = useCallback(() => {
     if (!svgRef.current || !zoomRef.current) return;
     d3.select(svgRef.current).transition().duration(400)
       .call(zoomRef.current.transform, d3.zoomIdentity);
   }, []);
 
+  // The two view modes use unrelated coordinate layouts — carrying a zoom
+  // transform over from one to the other would land on an empty area.
+  useEffect(() => { resetZoom(); }, [viewMode, resetZoom]);
+
   // ---------------------------------------------------------------------------
-  // Circle appearance helpers
+  // Circle appearance helpers — isActive is whatever group (category or
+  // post type) this circle belongs to, resolved by the caller
   // ---------------------------------------------------------------------------
-  function getCircleOpacity(cat, postId) {
-    const catActive = activeCategories.has(cat);
-    if (!catActive) return { fill: 0.08, stroke: 0 };
-    if (!searching)  return { fill: 0.7,  stroke: 0.3 };
+  function getCircleOpacity(isActive, postId) {
+    if (!isActive)  return { fill: 0.08, stroke: 0 };
+    if (!searching) return { fill: 0.7,  stroke: 0.3 };
     const matches = matchingIds.has(postId);
     return matches
       ? { fill: 0.88, stroke: 0.6 }
@@ -712,6 +1130,17 @@ export default function Explorer() {
         Reset view
       </button>
 
+      {/* Dump button — exports full threads of currently highlighted posts */}
+      <DumpButton
+        status={dumpStatus}
+        visibleCount={visiblePosts.length}
+        progress={dumpProgress}
+        error={dumpError}
+        onStart={startDump}
+        onConfirm={confirmDump}
+        onCancel={cancelDump}
+      />
+
       {/* SVG map */}
       <svg
         ref={svgRef}
@@ -720,88 +1149,183 @@ export default function Explorer() {
         onClick={e => { if (e.target.tagName === "svg") setSelectedPost(null); }}
       >
         <g ref={gRef}>
-          {/* Outer boundary circle */}
-          <circle cx={cx} cy={cy} r={outerR} fill="none" stroke="#E0DDD8" strokeWidth={1}/>
+          {viewMode === "category" ? (
+            <>
+              {/* Outer boundary circle */}
+              <circle cx={cx} cy={cy} r={outerR} fill="none" stroke="#E0DDD8" strokeWidth={1}/>
 
-          {/* Category clusters */}
-          {CATEGORIES.map(cat => {
-            const color    = CATEGORY_COLORS[cat] || CATEGORY_COLORS.other;
-            const circles  = clusters[cat] || [];
-            const centroid = centroids[cat];
-            if (!circles.length) return null;
+              {/* Category clusters */}
+              {CATEGORIES.map(cat => {
+                const color    = CATEGORY_COLORS[cat] || CATEGORY_COLORS.other;
+                const circles  = clusters[cat] || [];
+                const centroid = centroids[cat];
+                const catActive = activeCategories.has(cat);
+                if (!circles.length) return null;
 
-            return (
-              <g key={cat} transform={`translate(${cx}, ${cy})`}>
-                {circles.map((c, i) => {
-                  const { fill, stroke } = getCircleOpacity(cat, c.post.id);
-                  const isMatch = searching && matchingIds.has(c.post.id) && activeCategories.has(cat);
+                return (
+                  <g key={cat} transform={`translate(${cx}, ${cy})`}>
+                    {circles.map((c, i) => {
+                      const { fill, stroke } = getCircleOpacity(catActive, c.post.id);
+                      const isMatch = searching && matchingIds.has(c.post.id) && catActive;
 
-                  return (
-                    <g key={i}>
-                      <circle
-                        cx={c.x} cy={c.y} r={c.r}
-                        fill={color} fillOpacity={fill}
-                        stroke={color} strokeWidth={0.5} strokeOpacity={stroke}
-                        style={{ cursor: activeCategories.has(cat) ? "pointer" : "default" }}
-                        onMouseEnter={e => {
-                          if (!activeCategories.has(cat)) return;
-                          e.target.setAttribute("fill-opacity", "0.95");
-                          setTooltip({ post: c.post, x: e.clientX, y: e.clientY });
-                        }}
-                        onMouseMove={e => setTooltip(prev => prev ? { ...prev, x: e.clientX, y: e.clientY } : null)}
-                        onMouseLeave={e => {
-                          e.target.setAttribute("fill-opacity", String(fill));
-                          setTooltip(null);
-                        }}
-                        onClick={e => {
-                          if (!activeCategories.has(cat)) return;
-                          e.stopPropagation();
-                          setSelectedPost(c.post);
-                          setTooltip(null);
-                        }}
-                      />
-                      {/* Match ring */}
-                      {isMatch && (
-                        <circle
-                          cx={c.x} cy={c.y} r={c.r + 1.5}
-                          fill="none"
-                          stroke={color} strokeWidth={1.5} strokeOpacity={0.9}
-                          pointerEvents="none"
-                        />
-                      )}
+                      return (
+                        <g key={i}>
+                          <circle
+                            cx={c.x} cy={c.y} r={c.r}
+                            fill={color} fillOpacity={fill}
+                            stroke={color} strokeWidth={0.5} strokeOpacity={stroke}
+                            style={{ cursor: catActive ? "pointer" : "default" }}
+                            onMouseEnter={e => {
+                              if (!catActive) return;
+                              e.target.setAttribute("fill-opacity", "0.95");
+                              setTooltip({ post: c.post, x: e.clientX, y: e.clientY });
+                            }}
+                            onMouseMove={e => setTooltip(prev => prev ? { ...prev, x: e.clientX, y: e.clientY } : null)}
+                            onMouseLeave={e => {
+                              e.target.setAttribute("fill-opacity", String(fill));
+                              setTooltip(null);
+                            }}
+                            onClick={e => {
+                              if (!catActive) return;
+                              e.stopPropagation();
+                              setSelectedPost(c.post);
+                              setTooltip(null);
+                            }}
+                          />
+                          {/* Match ring */}
+                          {isMatch && (
+                            <circle
+                              cx={c.x} cy={c.y} r={c.r + 1.5}
+                              fill="none"
+                              stroke={color} strokeWidth={1.5} strokeOpacity={0.9}
+                              pointerEvents="none"
+                            />
+                          )}
+                        </g>
+                      );
+                    })}
+
+                    {/* Category label */}
+                    {centroid && (
+                      <text
+                        x={centroid.x} y={centroid.y}
+                        textAnchor="middle" dominantBaseline="central"
+                        fill="#000000"
+                        fillOpacity={catActive ? 0.8 : 0.1}
+                        fontSize={9} fontFamily="Inter,sans-serif"
+                        fontWeight={600} letterSpacing="0.1em"
+                        pointerEvents="all"
+                        style={{ cursor:"zoom-in" }}
+                        onClick={e => { e.stopPropagation(); zoomToCategory(cat); }}
+                      >
+                        {CATEGORY_LABELS[cat].toUpperCase()}
+                      </text>
+                    )}
+                  </g>
+                );
+              })}
+            </>
+          ) : (
+            <>
+              {/* Move-stage clusters: pre (left), ambiguous (center), post (right) */}
+              {MOVE_STAGES.map(stage => {
+                const center  = stageCenters[stage];
+                const circles = moveStageClusters[stage] || [];
+
+                return (
+                  <g key={stage}>
+                    <circle cx={center.x} cy={center.y} r={stageR} fill="none" stroke="#E0DDD8" strokeWidth={1}/>
+
+                    <g transform={`translate(${center.x}, ${center.y})`}>
+                      {circles.map((c, i) => {
+                        const ptype    = c.post.post_type;
+                        const color    = POST_TYPE_COLORS[ptype] || POST_TYPE_COLORS.other;
+                        const ptActive = activePostTypes.has(ptype);
+                        const { fill, stroke } = getCircleOpacity(ptActive, c.post.id);
+                        const isMatch = searching && matchingIds.has(c.post.id) && ptActive;
+
+                        return (
+                          <g key={i}>
+                            <circle
+                              cx={c.x} cy={c.y} r={c.r}
+                              fill={color} fillOpacity={fill}
+                              stroke={color} strokeWidth={0.5} strokeOpacity={stroke}
+                              style={{ cursor: ptActive ? "pointer" : "default" }}
+                              onMouseEnter={e => {
+                                if (!ptActive) return;
+                                e.target.setAttribute("fill-opacity", "0.95");
+                                setTooltip({ post: c.post, x: e.clientX, y: e.clientY });
+                              }}
+                              onMouseMove={e => setTooltip(prev => prev ? { ...prev, x: e.clientX, y: e.clientY } : null)}
+                              onMouseLeave={e => {
+                                e.target.setAttribute("fill-opacity", String(fill));
+                                setTooltip(null);
+                              }}
+                              onClick={e => {
+                                if (!ptActive) return;
+                                e.stopPropagation();
+                                setSelectedPost(c.post);
+                                setTooltip(null);
+                              }}
+                            />
+                            {/* Match ring */}
+                            {isMatch && (
+                              <circle
+                                cx={c.x} cy={c.y} r={c.r + 1.5}
+                                fill="none"
+                                stroke={color} strokeWidth={1.5} strokeOpacity={0.9}
+                                pointerEvents="none"
+                              />
+                            )}
+                          </g>
+                        );
+                      })}
                     </g>
-                  );
-                })}
 
-                {/* Category label */}
-                {centroid && (
-                  <text
-                    x={centroid.x} y={centroid.y}
-                    textAnchor="middle" dominantBaseline="central"
-                    fill="#000000"
-                    fillOpacity={activeCategories.has(cat) ? 0.8 : 0.1}
-                    fontSize={9} fontFamily="Inter,sans-serif"
-                    fontWeight={600} letterSpacing="0.1em"
-                    pointerEvents="all"
-                    style={{ cursor:"zoom-in" }}
-                    onClick={e => { e.stopPropagation(); zoomToCategory(cat); }}
-                  >
-                    {CATEGORY_LABELS[cat].toUpperCase()}
-                  </text>
-                )}
-              </g>
-            );
-          })}
+                    {/* Stage label */}
+                    <text
+                      x={center.x} y={center.y - stageR - 14}
+                      textAnchor="middle" dominantBaseline="central"
+                      fill="#000000" fillOpacity={0.8}
+                      fontSize={9} fontFamily="Inter,sans-serif"
+                      fontWeight={600} letterSpacing="0.1em"
+                      pointerEvents="all"
+                      style={{ cursor:"zoom-in" }}
+                      onClick={e => { e.stopPropagation(); zoomToStage(stage); }}
+                    >
+                      {MOVE_STAGE_LABELS[stage].toUpperCase()}
+                    </text>
+                  </g>
+                );
+              })}
+            </>
+          )}
         </g>
       </svg>
 
       {/* Legend */}
-      <Legend
-        sortedCats={sortedCats}
-        counts={CORPUS_COUNTS}
-        activeCategories={activeCategories}
-        onToggle={toggleCategory}
-      />
+      {viewMode === "category" ? (
+        <Legend
+          title="Categories"
+          items={sortedCats.map(cat => ({
+            key: cat, label: CATEGORY_LABELS[cat], color: CATEGORY_COLORS[cat], count: CORPUS_COUNTS[cat],
+          }))}
+          activeKeys={activeCategories}
+          onToggle={toggleCategory}
+        />
+      ) : (
+        <Legend
+          title="Post Type"
+          items={POST_TYPES.map(pt => ({
+            key: pt, label: POST_TYPE_LABELS[pt], color: POST_TYPE_COLORS[pt], count: postTypeCounts[pt],
+          }))}
+          activeKeys={activePostTypes}
+          onToggle={togglePostType}
+        />
+      )}
+
+      {/* View mode toggle */}
+      <ViewModeToggle mode={viewMode} onChange={setViewMode} />
 
       {/* Score slider */}
       <ScoreSlider
