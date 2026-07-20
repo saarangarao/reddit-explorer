@@ -296,13 +296,20 @@ function computeQuarterHistogram(posts, quarters, centerX, columnWidth, floorY) 
       y: floorY - Math.floor(i / perRow) * 12 - 10,
     }));
 
+    // alphaDecay is cranked well above d3's default (0.0228, tuned for
+    // random-start layouts that need ~300 ticks to untangle) since these
+    // nodes start from an already-organized grid — cooling fast just means
+    // "stop once it's stopped moving" instead of always spending a fixed
+    // 200 ticks whether or not the layout has settled.
     const sim = d3.forceSimulation(nodes)
       .force("x", d3.forceX(cx).strength(0.06))
       .force("y", d3.forceY(floorY).strength(0.2))
-      .force("collide", d3.forceCollide(d => d.r + 0.6).iterations(3))
+      .force("collide", d3.forceCollide(d => d.r + 0.6).iterations(2))
+      .alphaDecay(0.08)
       .stop();
 
-    for (let i = 0; i < 200; i++) {
+    const MAX_TICKS = 200; // safety cap; alpha threshold below exits earlier in practice
+    for (let i = 0; i < MAX_TICKS; i++) {
       sim.tick();
       // Hard walls: the simulation's forces are soft (spring-like) and can
       // overshoot, so clamp back inside the beaker and above the floor
@@ -312,6 +319,7 @@ function computeQuarterHistogram(posts, quarters, centerX, columnWidth, floorY) 
         n.x = Math.max(cx - halfWidth + n.r, Math.min(cx + halfWidth - n.r, n.x));
         n.y = Math.min(floorY - n.r, n.y);
       });
+      if (sim.alpha() < sim.alphaMin()) break;
     }
 
     clusters[q] = nodes.map(n => ({ x: n.x, y: n.y, r: n.r, post: n.post }));
@@ -1178,6 +1186,7 @@ export default function Explorer() {
     setActivePostTypes(new Set(POST_TYPES));
     setSearchQuery("");
     setScoreSliderPos(0);
+    setDebouncedSliderPos(0);
     setSelectedPost(null);
     setTooltip(null);
     setDumpStatus("idle");
@@ -1190,11 +1199,26 @@ export default function Explorer() {
     () => (allPosts.length ? Math.max(...allPosts.map(p => p.score)) : 0),
     [allPosts]
   );
-  const minScore = useMemo(() => {
-    if (scoreSliderPos <= 0) return 0;
-    const t = scoreSliderPos / 100;
+  const sliderPosToScore = useCallback((pos) => {
+    if (pos <= 0) return 0;
+    const t = pos / 100;
     return Math.round(Math.expm1(t * Math.log1p(maxScore)));
-  }, [scoreSliderPos, maxScore]);
+  }, [maxScore]);
+
+  // The readout label tracks the raw slider position instantly. The value
+  // that actually drives filtering/layout is debounced — dragging the
+  // slider re-triggers computeLayout/computeBucketLayout/
+  // computeQuarterHistogram (the latter a 200-tick force simulation per
+  // quarter), which is too expensive to redo on every intermediate tick.
+  const displayMinScore = useMemo(() => sliderPosToScore(scoreSliderPos), [scoreSliderPos, sliderPosToScore]);
+
+  const [debouncedSliderPos, setDebouncedSliderPos] = useState(scoreSliderPos);
+  useEffect(() => {
+    const id = setTimeout(() => setDebouncedSliderPos(scoreSliderPos), 120);
+    return () => clearTimeout(id);
+  }, [scoreSliderPos]);
+
+  const minScore = useMemo(() => sliderPosToScore(debouncedSliderPos), [debouncedSliderPos, sliderPosToScore]);
 
   // Base filter applied before anything else — every downstream toggle,
   // search, and layout operates only on posts that clear this bar, so the
@@ -1321,10 +1345,10 @@ export default function Explorer() {
   const cx = VW / 2;
   const cy = VH / 2;
 
-  const { clusters, centroids } = useMemo(
-    () => computeLayout(posts, outerR),
-    [posts, outerR]
-  );
+  const { clusters, centroids } = useMemo(() => {
+    if (viewMode !== "category") return { clusters: {}, centroids: {} };
+    return computeLayout(posts, outerR);
+  }, [posts, outerR, viewMode]);
 
   // Three fixed-position circles, left-to-right, one per move stage. Sized
   // to fill the viewport since there are always exactly 3.
@@ -1335,10 +1359,10 @@ export default function Explorer() {
     return c;
   }, [VW, cy]);
 
-  const moveStageClusters = useMemo(
-    () => computeBucketLayout(posts, MOVE_STAGES, "move_stage", stageR, "post_type", POST_TYPES),
-    [posts, stageR]
-  );
+  const moveStageClusters = useMemo(() => {
+    if (viewMode !== "move") return {};
+    return computeBucketLayout(posts, MOVE_STAGES, "move_stage", stageR, "post_type", POST_TYPES);
+  }, [posts, stageR, viewMode]);
 
   // Quarter timeline as a dot-histogram: narrow fixed-width columns (not
   // sized by count, real bars don't get wider with more data, only
@@ -1357,10 +1381,10 @@ export default function Explorer() {
     return c;
   }, [quarters]);
 
-  const { clusters: quarterClusters, counts: quarterCounts } = useMemo(
-    () => computeQuarterHistogram(posts, quarters, quarterCenters, columnWidth, floorY),
-    [posts, quarters, quarterCenters, floorY]
-  );
+  const { clusters: quarterClusters, counts: quarterCounts } = useMemo(() => {
+    if (viewMode !== "quarter") return { clusters: {}, counts: {} };
+    return computeQuarterHistogram(posts, quarters, quarterCenters, columnWidth, floorY);
+  }, [posts, quarters, quarterCenters, floorY, viewMode]);
 
   // ---------------------------------------------------------------------------
   // D3 zoom — scaleExtent goes wider than [0.4,10] on the low end so a
@@ -1819,7 +1843,7 @@ export default function Explorer() {
       <ScoreSlider
         sliderPos={scoreSliderPos}
         onChange={setScoreSliderPos}
-        minScore={minScore}
+        minScore={displayMinScore}
         visibleCount={posts.length}
         totalCount={allPosts.length}
       />
