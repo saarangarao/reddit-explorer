@@ -1,7 +1,36 @@
 import { useState, useMemo, useRef, useEffect, useCallback } from "react";
 import * as d3 from "d3";
 
-import postsData from "./posts_viz.json";
+// ---------------------------------------------------------------------------
+// Subreddit registry — each dataset is fetched at runtime (not bundled), so
+// switching subreddits is just a re-fetch, no rebuild. viewModes lists which
+// clustering axes this dataset supports; "quarter" is universal (derived
+// purely from created_utc, every post has one regardless of subreddit),
+// "category"/"move" require compute_metrics.py's LLM/lexicon classification
+// and are currently only meaningful for r/returnToIndia.
+// ---------------------------------------------------------------------------
+const SUBREDDITS = [
+  {
+    id: "returntoindia", label: "r/returnToIndia",
+    dataPath: "data/returntoindia/posts_viz.json",
+    threadsPath: "data/returntoindia/threads",
+    viewModes: ["category", "move", "quarter"],
+  },
+  {
+    id: "h1b", label: "r/h1b",
+    dataPath: "data/h1b/posts_viz.json",
+    threadsPath: "data/h1b/threads",
+    viewModes: ["quarter"],
+  },
+  {
+    id: "usvisascheduling", label: "r/usvisascheduling",
+    dataPath: "data/usvisascheduling/posts_viz.json",
+    threadsPath: "data/usvisascheduling/threads",
+    viewModes: ["quarter"],
+  },
+];
+
+const VIEW_MODE_LABELS = { category: "By Category", move: "By Move Stage", quarter: "By Quarter" };
 
 const CATEGORIES = [
   "career","finances","logistics","relationships",
@@ -56,6 +85,38 @@ const POST_TYPE_COLORS = {
 
 const POST_TYPE_LABELS = { question: "Question", rant: "Rant", other: "Other" };
 
+// Quarter-timeline coloring: post-covid is a flat accent color; covid-window
+// posts (Jan 2020 - May 2023) blend toward a "severity" color, strongest at
+// the window's midpoint (no specific peak date was given, so this defaults
+// to the center of the range and tapers smoothly toward both edges) and
+// fading back to the post-covid color at the boundaries. Classification is
+// per-post (from created_utc), not per-quarter-bucket, since some quarters
+// straddle the boundary (e.g. 2023-Q2 spans Apr-Jun, only Apr-May are
+// in-window). Anything outside the window, including anything before it,
+// counts as post-covid.
+const QUARTER_COLOR = "#7B9E87"; // post-covid / default
+const COVID_PEAK_COLOR = "#B85450"; // strongest color at peak severity
+
+const COVID_START = Date.UTC(2020, 0, 1) / 1000;           // Jan 1, 2020
+const COVID_END   = Date.UTC(2023, 4, 31, 23, 59, 59) / 1000; // May 31, 2023
+const COVID_PEAK   = (COVID_START + COVID_END) / 2;         // range midpoint, ~Sep 2021
+
+const covidColorScale = d3.interpolateRgb(QUARTER_COLOR, COVID_PEAK_COLOR);
+
+// Returns 0-1, 0 outside the covid window (or exactly at its edges), 1 at
+// the peak, smoothly tapering in between (raised-cosine / Hann window).
+function covidIntensity(createdUtc) {
+  if (!createdUtc || createdUtc < COVID_START || createdUtc > COVID_END) return 0;
+  const halfSpan = (COVID_END - COVID_START) / 2;
+  const distFromPeak = Math.abs(createdUtc - COVID_PEAK);
+  const t = Math.min(1, distFromPeak / halfSpan);
+  return 0.5 * (1 + Math.cos(Math.PI * t));
+}
+
+function quarterPostColor(post) {
+  return covidColorScale(covidIntensity(post.created_utc));
+}
+
 // ---------------------------------------------------------------------------
 // Keyword matching — scope is either 'post' (title + selftext only)
 // or 'thread' (title + full flattened thread text, including comments)
@@ -74,6 +135,14 @@ function matchesSearch(post, keywords, scope, mode) {
 // Pack layout — static, computed once
 // ---------------------------------------------------------------------------
 function computeLayout(posts, outerR) {
+  // Same empty-children pitfall as below, but at the root: with zero posts
+  // (e.g. the async fetch hasn't resolved yet) every category is
+  // simultaneously empty, so root.children itself would be [], and
+  // d3.hierarchy() would misread the whole root as a leaf with no parent —
+  // "leaf.parent.data" then throws on null. Short-circuit before ever
+  // building that tree.
+  if (!posts.length) return { clusters: {}, centroids: {} };
+
   const byCategory = {};
   CATEGORIES.forEach(cat => { byCategory[cat] = []; });
   posts.forEach(p => { if (byCategory[p.category]) byCategory[p.category].push(p); });
@@ -130,57 +199,125 @@ function computeLayout(posts, outerR) {
 }
 
 // ---------------------------------------------------------------------------
-// Pack layout for the move-stage view — three independent packs (one per
-// stage), each confined to its own fixed-radius circle, rather than one
-// shared pack. That's what gives pre/ambiguous/post their fixed left-to-
-// right ordering, instead of leaving placement up to the pack algorithm.
-//
-// Within a stage, posts are nested one level deeper by post_type first —
-// same two-level hierarchy trick computeLayout() uses for categories — so
-// same-type posts pack next to each other instead of being scattered
-// throughout the stage circle by size alone.
+// Generic "N fixed circles side by side" pack layout — one independent pack
+// per bucket, each confined to its own fixed-radius circle, rather than one
+// shared pack. That's what gives buckets their fixed left-to-right ordering,
+// instead of leaving placement up to the pack algorithm. Used for both the
+// move-stage view (3 buckets, sub-nested by post_type) and the quarter
+// timeline (N buckets, flat) — the only difference is whether a sub-field
+// is provided for a second nesting level.
 // ---------------------------------------------------------------------------
-function computeMoveStageLayout(posts, stageR) {
-  const byStage = {};
-  MOVE_STAGES.forEach(s => { byStage[s] = []; });
-  posts.forEach(p => { if (byStage[p.move_stage]) byStage[p.move_stage].push(p); });
+function computeBucketLayout(posts, buckets, bucketField, bucketR, subField, subTypes) {
+  const byBucket = {};
+  buckets.forEach(b => { byBucket[b] = []; });
+  posts.forEach(p => { if (byBucket[p[bucketField]]) byBucket[p[bucketField]].push(p); });
 
   const clusters = {};
-  MOVE_STAGES.forEach(stage => {
-    const stagePosts = byStage[stage];
-    if (!stagePosts.length) { clusters[stage] = []; return; }
+  buckets.forEach(bucket => {
+    const bucketPosts = byBucket[bucket];
+    if (!bucketPosts.length) { clusters[bucket] = []; return; }
 
-    const byType = {};
-    POST_TYPES.forEach(pt => { byType[pt] = []; });
-    stagePosts.forEach(p => { if (byType[p.post_type]) byType[p.post_type].push(p); });
+    let root;
+    if (subField && subTypes) {
+      const bySub = {};
+      subTypes.forEach(s => { bySub[s] = []; });
+      bucketPosts.forEach(p => { if (bySub[p[subField]]) bySub[p[subField]].push(p); });
 
-    // Same empty-children pitfall as computeLayout(): a post_type with 0
-    // posts in this stage must be left out of the tree entirely, or
-    // d3.hierarchy() misreads its childless node as a post leaf.
-    const root = {
-      children: POST_TYPES
-        .filter(pt => byType[pt].length > 0)
-        .map(pt => ({
-          ptype: pt,
-          children: byType[pt].map(p => ({ post: p, r: p.radius, value: p.radius * p.radius })),
-        })),
-    };
+      // Same empty-children pitfall as computeLayout(): a sub-type with 0
+      // posts in this bucket must be left out of the tree entirely, or
+      // d3.hierarchy() misreads its childless node as a post leaf.
+      root = {
+        children: subTypes
+          .filter(s => bySub[s].length > 0)
+          .map(s => ({
+            sub: s,
+            children: bySub[s].map(p => ({ post: p, r: p.radius, value: p.radius * p.radius })),
+          })),
+      };
+    } else {
+      root = {
+        children: bucketPosts.map(p => ({ post: p, r: p.radius, value: p.radius * p.radius })),
+      };
+    }
 
-    const pack = d3.pack().size([stageR * 2, stageR * 2]).padding(1.5);
+    const pack = d3.pack().size([bucketR * 2, bucketR * 2]).padding(1.5);
     const hierarchy = d3.hierarchy(root)
       .sum(d => d.value || 0)
       .sort((a, b) => b.value - a.value);
     pack(hierarchy);
 
-    clusters[stage] = hierarchy.leaves().map(leaf => ({
-      x: leaf.x - stageR,
-      y: leaf.y - stageR,
+    clusters[bucket] = hierarchy.leaves().map(leaf => ({
+      x: leaf.x - bucketR,
+      y: leaf.y - bucketR,
       r: leaf.r,
       post: leaf.data.post,
     }));
   });
 
   return clusters;
+}
+
+// ---------------------------------------------------------------------------
+// Quarter timeline as a dot-histogram — a Wilkinson-style plot, not a
+// circle pack: each quarter is a narrow fixed-width column, and posts (as
+// circles) settle onto a shared baseline via a d3-force simulation
+// (downward pull + collision), stacking like balls dropped into a thin
+// beaker. Column height reads as post volume for that quarter, and the
+// "bar" is literally made of the individual posts, not a drawn rectangle.
+// Deliberately not a circle pack: pack fills a fixed bounding shape
+// regardless of count, which can't represent "how much" the way a
+// variable-height stack can.
+// ---------------------------------------------------------------------------
+function computeQuarterHistogram(posts, quarters, centerX, columnWidth, floorY) {
+  const byQuarter = {};
+  quarters.forEach(q => { byQuarter[q] = []; });
+  posts.forEach(p => { if (byQuarter[p.quarter]) byQuarter[p.quarter].push(p); });
+
+  const clusters = {};
+  const counts = {};
+  const halfWidth = columnWidth / 2;
+
+  quarters.forEach(q => {
+    const qPosts = byQuarter[q];
+    counts[q] = qPosts.length;
+    if (!qPosts.length) { clusters[q] = []; return; }
+
+    const cx = centerX[q];
+
+    // Deterministic initial layout (rows stacked upward from the floor,
+    // spread evenly across the column) rather than random jitter, so the
+    // simulation converges quickly and consistently from a sane starting
+    // point instead of untangling from noise.
+    const perRow = Math.max(1, Math.floor(columnWidth / 12));
+    const nodes = qPosts.map((p, i) => ({
+      post: p,
+      r: p.radius,
+      x: cx + ((i % perRow) - (perRow - 1) / 2) * (columnWidth / perRow),
+      y: floorY - Math.floor(i / perRow) * 12 - 10,
+    }));
+
+    const sim = d3.forceSimulation(nodes)
+      .force("x", d3.forceX(cx).strength(0.06))
+      .force("y", d3.forceY(floorY).strength(0.2))
+      .force("collide", d3.forceCollide(d => d.r + 0.6).iterations(3))
+      .stop();
+
+    for (let i = 0; i < 200; i++) {
+      sim.tick();
+      // Hard walls: the simulation's forces are soft (spring-like) and can
+      // overshoot, so clamp back inside the beaker and above the floor
+      // after every tick rather than trusting the forces alone to respect
+      // boundaries they don't actually know about.
+      nodes.forEach(n => {
+        n.x = Math.max(cx - halfWidth + n.r, Math.min(cx + halfWidth - n.r, n.x));
+        n.y = Math.min(floorY - n.r, n.y);
+      });
+    }
+
+    clusters[q] = nodes.map(n => ({ x: n.x, y: n.y, r: n.r, post: n.post }));
+  });
+
+  return { clusters, counts };
 }
 
 // ---------------------------------------------------------------------------
@@ -296,13 +433,15 @@ function SearchBar({ value, onChange, matchCount, searching, scope, onScopeChang
 }
 
 // ---------------------------------------------------------------------------
-// In-memory cache so re-opening an already-viewed thread doesn't re-fetch
+// In-memory cache so re-opening an already-viewed thread doesn't re-fetch.
+// Keyed by post ID alone (fine across subreddits too — real Reddit post IDs
+// are globally unique).
 // ---------------------------------------------------------------------------
 const threadCache = new Map();
 
-async function fetchThreadData(postId) {
+async function fetchThreadData(postId, threadsPath) {
   if (threadCache.has(postId)) return threadCache.get(postId);
-  const res = await fetch(`${import.meta.env.BASE_URL}threads/${postId}.json`);
+  const res = await fetch(`${import.meta.env.BASE_URL}${threadsPath}/${postId}.json`);
   if (!res.ok) throw new Error(`Failed to load thread ${postId} (${res.status})`);
   const data = await res.json();
   threadCache.set(postId, data);
@@ -345,7 +484,7 @@ function renderPostMd(index, post, threadData) {
   lines.push(`## ${index}. ${mdEscapeHeading(post.title)}`);
   lines.push("");
   lines.push(`- **Score:** ${post.score.toLocaleString()}  |  **Comments:** ${post.comments.toLocaleString()}`);
-  lines.push(`- **Category:** ${CATEGORY_LABELS[post.category] || post.category}  |  **Move stage:** ${MOVE_STAGE_LABELS[post.move_stage] || post.move_stage}  |  **Post type:** ${POST_TYPE_LABELS[post.post_type] || post.post_type}`);
+  lines.push(`- **Category:** ${CATEGORY_LABELS[post.category] || post.category}  |  **Move stage:** ${MOVE_STAGE_LABELS[post.move_stage] || post.move_stage}  |  **Post type:** ${POST_TYPE_LABELS[post.post_type] || post.post_type}  |  **Quarter:** ${post.quarter}`);
   lines.push(`- **Post ID:** ${post.id}`);
   lines.push("");
 
@@ -380,57 +519,66 @@ function renderPostMd(index, post, threadData) {
   return lines.join("\n");
 }
 
-function renderDumpHeader({ posts, viewMode, keywords, searchScope, matchMode, minScore, activeCategories, activePostTypes }) {
+function renderDumpHeader({ posts, subredditLabel, viewMode, availableModes, keywords, searchScope, matchMode, minScore, activeCategories, activePostTypes }) {
   const lines = [];
-  lines.push(`# r/returnToIndia — Thread Dump`);
+  lines.push(`# ${subredditLabel} — Thread Dump`);
   lines.push("");
   lines.push(`- **Posts included:** ${posts.length.toLocaleString()}`);
   lines.push(`- **Ordered by:** score (descending)`);
-  lines.push(`- **Classification view:** ${viewMode === "category" ? "By Category" : "By Move Stage"}`);
+  lines.push(`- **Classification view:** ${VIEW_MODE_LABELS[viewMode] || viewMode}`);
 
   lines.push(keywords.length
     ? `- **Keyword search:** {${keywords.join(", ")}} — match ${matchMode.toUpperCase()}, scope: ${searchScope === "post" ? "Post Only" : "Full Thread"}`
     : `- **Keyword search:** none`);
   lines.push(`- **Min upvotes:** ${minScore.toLocaleString()}+`);
 
-  if (viewMode === "category") {
+  if (viewMode === "category" && availableModes.includes("category")) {
     const active = CATEGORIES.filter(c => activeCategories.has(c));
     lines.push(`- **Active categories:** ${active.length === CATEGORIES.length ? "all" : active.map(c => CATEGORY_LABELS[c]).join(", ") || "none"}`);
-  } else {
+  } else if (viewMode === "move" && availableModes.includes("move")) {
     const active = POST_TYPES.filter(t => activePostTypes.has(t));
     lines.push(`- **Active post types:** ${active.length === POST_TYPES.length ? "all" : active.map(t => POST_TYPE_LABELS[t]).join(", ") || "none"}`);
   }
 
-  const catCounts = {}, stageCounts = {}, typeCounts = {};
+  const catCounts = {}, stageCounts = {}, typeCounts = {}, quarterCounts = {};
   posts.forEach(p => {
     catCounts[p.category]     = (catCounts[p.category]||0) + 1;
     stageCounts[p.move_stage] = (stageCounts[p.move_stage]||0) + 1;
     typeCounts[p.post_type]   = (typeCounts[p.post_type]||0) + 1;
+    quarterCounts[p.quarter]  = (quarterCounts[p.quarter]||0) + 1;
   });
 
   lines.push("");
-  lines.push(`**Category breakdown:** ` + Object.entries(catCounts)
-    .sort((a, b) => b[1] - a[1])
-    .map(([k, v]) => `${CATEGORY_LABELS[k] || k}: ${v}`)
+  if (availableModes.includes("category")) {
+    lines.push(`**Category breakdown:** ` + Object.entries(catCounts)
+      .sort((a, b) => b[1] - a[1])
+      .map(([k, v]) => `${CATEGORY_LABELS[k] || k}: ${v}`)
+      .join(", "));
+  }
+  if (availableModes.includes("move")) {
+    lines.push(`**Move-stage breakdown:** ` + MOVE_STAGES.map(s => `${MOVE_STAGE_LABELS[s]}: ${stageCounts[s]||0}`).join(", "));
+    lines.push(`**Post-type breakdown:** ` + POST_TYPES.map(t => `${POST_TYPE_LABELS[t]}: ${typeCounts[t]||0}`).join(", "));
+  }
+  lines.push(`**Quarter breakdown:** ` + Object.entries(quarterCounts)
+    .sort((a, b) => a[0].localeCompare(b[0]))
+    .map(([k, v]) => `${k}: ${v}`)
     .join(", "));
-  lines.push(`**Move-stage breakdown:** ` + MOVE_STAGES.map(s => `${MOVE_STAGE_LABELS[s]}: ${stageCounts[s]||0}`).join(", "));
-  lines.push(`**Post-type breakdown:** ` + POST_TYPES.map(t => `${POST_TYPE_LABELS[t]}: ${typeCounts[t]||0}`).join(", "));
   lines.push("");
   lines.push("---");
   lines.push("");
   return lines.join("\n");
 }
 
-async function buildDumpMarkdown({ posts, viewMode, keywords, searchScope, matchMode, minScore, activeCategories, activePostTypes, onProgress }) {
+async function buildDumpMarkdown({ posts, subredditLabel, threadsPath, viewMode, availableModes, keywords, searchScope, matchMode, minScore, activeCategories, activePostTypes, onProgress }) {
   const sorted = [...posts].sort((a, b) => b.score - a.score);
-  const header = renderDumpHeader({ posts: sorted, viewMode, keywords, searchScope, matchMode, minScore, activeCategories, activePostTypes });
+  const header = renderDumpHeader({ posts: sorted, subredditLabel, viewMode, availableModes, keywords, searchScope, matchMode, minScore, activeCategories, activePostTypes });
 
   let done = 0;
   const total = sorted.length;
   onProgress?.(0, total);
 
   const threadDataList = await mapWithConcurrency(sorted, 10, async (post) => {
-    const data = await fetchThreadData(post.id);
+    const data = await fetchThreadData(post.id, threadsPath);
     done += 1;
     onProgress?.(done, total);
     return data;
@@ -509,7 +657,7 @@ function CommentNode({ node, depth, color, highlight }) {
 // ---------------------------------------------------------------------------
 // Thread panel — fetches the full nested thread + stats for the selected post
 // ---------------------------------------------------------------------------
-function ThreadPanel({ post, keywords, onClose }) {
+function ThreadPanel({ post, threadsPath, keywords, onClose }) {
   const [threadData, setThreadData] = useState(null);
   const [loading, setLoading]       = useState(true);
   const [error, setError]           = useState(null);
@@ -521,7 +669,7 @@ function ThreadPanel({ post, keywords, onClose }) {
     setError(null);
     setThreadData(null);
 
-    fetchThreadData(post.id)
+    fetchThreadData(post.id, threadsPath)
       .then(data => {
         if (cancelled) return;
         setThreadData(data);
@@ -534,7 +682,7 @@ function ThreadPanel({ post, keywords, onClose }) {
       });
 
     return () => { cancelled = true; };
-  }, [post.id]);
+  }, [post.id, threadsPath]);
 
   function highlight(text) {
     if (!keywords.length) return text;
@@ -731,10 +879,61 @@ function Legend({ title, items, activeKeys, onToggle }) {
 }
 
 // ---------------------------------------------------------------------------
-// View mode toggle — switches between the category clustering and the
-// move-stage/post-type clustering
+// CovidLegend — explains the covid/post-covid gradient in quarter view.
 // ---------------------------------------------------------------------------
-function ViewModeToggle({ mode, onChange }) {
+function CovidLegend() {
+  const [expanded, setExpanded] = useState(true);
+
+  return (
+    <div style={{
+      position:"fixed", bottom:24, left:24,
+      background:"#FAFAF8", border:"1px solid #E0DDD8",
+      borderRadius:8, padding:"12px 14px",
+      fontFamily:"Inter,sans-serif", zIndex:50,
+      minWidth:168,
+      boxShadow:"0 2px 10px rgba(0,0,0,0.05)",
+      transition:"all 0.2s ease",
+    }}>
+      <div
+        onClick={() => setExpanded(prev => !prev)}
+        style={{
+          display:"flex", alignItems:"center", justifyContent:"space-between",
+          cursor:"pointer", marginBottom: expanded ? 9 : 0,
+        }}
+      >
+        <p style={{ margin:0, fontSize:9, fontWeight:600, letterSpacing:"0.1em", textTransform:"uppercase", color:"#CCC" }}>
+          Coloring
+        </p>
+        <span style={{ fontSize:10, color:"#CCC", marginLeft:10, lineHeight:1 }}>
+          {expanded ? "▾" : "▸"}
+        </span>
+      </div>
+
+      {expanded && (
+        <>
+          <div style={{
+            height:8, borderRadius:4, marginBottom:6,
+            background: `linear-gradient(to right, ${QUARTER_COLOR}, ${COVID_PEAK_COLOR}, ${QUARTER_COLOR})`,
+          }}/>
+          <div style={{ display:"flex", justifyContent:"space-between", fontSize:10, color:"#AAA", marginBottom:8 }}>
+            <span>Jan 2020</span>
+            <span>peak</span>
+            <span>May 2023</span>
+          </div>
+          <p style={{ margin:0, fontSize:11, color:"#2C2C2C", lineHeight:1.4 }}>
+            Posts are colored by closeness to peak covid severity (~Sep 2021). Posts outside Jan 2020 – May 2023 stay the default color.
+          </p>
+        </>
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// View mode toggle — switches between whichever clustering axes the active
+// subreddit supports (category / move stage / quarter)
+// ---------------------------------------------------------------------------
+function ViewModeToggle({ mode, modes, onChange }) {
   return (
     <div style={{
       position:"fixed", top:46, left:28,
@@ -743,7 +942,7 @@ function ViewModeToggle({ mode, onChange }) {
       boxShadow:"0 2px 10px rgba(0,0,0,0.05)",
       fontFamily:"Inter,sans-serif", zIndex:50,
     }}>
-      {[["category", "By Category"], ["move", "By Move Stage"]].map(([m, label]) => (
+      {modes.map(m => (
         <button
           key={m}
           onClick={() => onChange(m)}
@@ -756,9 +955,65 @@ function ViewModeToggle({ mode, onChange }) {
             transition:"all 0.15s",
           }}
         >
-          {label}
+          {VIEW_MODE_LABELS[m] || m}
         </button>
       ))}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Subreddit switcher — click the title to open a dropdown of every dataset
+// ---------------------------------------------------------------------------
+function SubredditSwitcher({ subreddits, activeId, onChange }) {
+  const [open, setOpen] = useState(false);
+  const active = subreddits.find(s => s.id === activeId);
+
+  return (
+    <div style={{ position:"relative", pointerEvents:"auto" }}>
+      <h1
+        onClick={() => setOpen(o => !o)}
+        style={{
+          margin:0, fontSize:13, fontWeight:600, color:"#1A1A1A",
+          fontFamily:"Inter,sans-serif", letterSpacing:"-0.01em",
+          cursor:"pointer", display:"flex", alignItems:"center", gap:5,
+          userSelect:"none",
+        }}
+      >
+        {active?.label || "Select subreddit"}
+        <span style={{ fontSize:9, color:"#CCC" }}>{open ? "▾" : "▸"}</span>
+      </h1>
+
+      {open && (
+        <>
+          <div
+            onClick={() => setOpen(false)}
+            style={{ position:"fixed", inset:0, zIndex:59 }}
+          />
+          <div style={{
+            position:"absolute", top:"calc(100% + 6px)", left:0, zIndex:60,
+            background:"#FAFAF8", border:"1px solid #E0DDD8", borderRadius:7,
+            boxShadow:"0 4px 16px rgba(0,0,0,0.1)", overflow:"hidden", minWidth:190,
+          }}>
+            {subreddits.map(s => (
+              <div
+                key={s.id}
+                onClick={() => { onChange(s.id); setOpen(false); }}
+                style={{
+                  padding:"8px 13px", fontSize:12, cursor:"pointer",
+                  fontFamily:"Inter,sans-serif",
+                  background: s.id === activeId ? "#F0EEE9" : "transparent",
+                  color:"#1A1A1A", fontWeight: s.id === activeId ? 600 : 400,
+                }}
+                onMouseEnter={e => { e.currentTarget.style.background = "#F0EEE9"; }}
+                onMouseLeave={e => { e.currentTarget.style.background = s.id === activeId ? "#F0EEE9" : "transparent"; }}
+              >
+                {s.label}
+              </div>
+            ))}
+          </div>
+        </>
+      )}
     </div>
   );
 }
@@ -849,22 +1104,60 @@ function DumpButton({ status, visibleCount, progress, error, onStart, onConfirm,
 // Main
 // ---------------------------------------------------------------------------
 export default function Explorer() {
+  const [subredditId, setSubredditId] = useState(SUBREDDITS[0].id);
+  const activeSubreddit = useMemo(
+    () => SUBREDDITS.find(s => s.id === subredditId) || SUBREDDITS[0],
+    [subredditId]
+  );
+
+  // Data is fetched at runtime per subreddit, not bundled at build time —
+  // switching subreddits is just a re-fetch of a different static JSON path.
+  const [rawPosts, setRawPosts]         = useState(null);
+  const [postsLoading, setPostsLoading] = useState(true);
+  const [postsErrorMsg, setPostsErrorMsg] = useState(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    setPostsLoading(true);
+    setPostsErrorMsg(null);
+    setRawPosts(null);
+
+    fetch(`${import.meta.env.BASE_URL}${activeSubreddit.dataPath}`)
+      .then(res => {
+        if (!res.ok) throw new Error(`Failed to load ${activeSubreddit.dataPath} (${res.status})`);
+        return res.json();
+      })
+      .then(data => {
+        if (cancelled) return;
+        setRawPosts(data);
+        setPostsLoading(false);
+      })
+      .catch(err => {
+        if (cancelled) return;
+        setPostsErrorMsg(err.message);
+        setPostsLoading(false);
+      });
+
+    return () => { cancelled = true; };
+  }, [activeSubreddit.dataPath]);
+
   const allPosts = useMemo(() => {
-    const engs = postsData.map(p => p.engagement);
+    if (!rawPosts || !rawPosts.length) return [];
+    const engs = rawPosts.map(p => p.engagement);
     const eMin = Math.min(...engs);
     const eMax = Math.max(...engs);
     const span = eMax - eMin || 1;
-    return postsData.map(p => ({
+    return rawPosts.map(p => ({
       ...p,
       radius: 2.5 + 7 * (p.engagement - eMin) / span,
     }));
-  }, []);
+  }, [rawPosts]);
 
   const [selectedPost, setSelectedPost]         = useState(null);
   const [tooltip, setTooltip]                   = useState(null);
   const [activeCategories, setActiveCategories] = useState(new Set(CATEGORIES));
   const [activePostTypes, setActivePostTypes]   = useState(new Set(POST_TYPES));
-  const [viewMode, setViewMode]                 = useState("category"); // 'category' | 'move'
+  const [viewMode, setViewMode]                 = useState(activeSubreddit.viewModes[0]);
   const [searchQuery, setSearchQuery]           = useState("");
   const [searchScope, setSearchScope]           = useState("thread"); // 'post' | 'thread'
   const [matchMode, setMatchMode]               = useState("any"); // 'any' | 'all', for 2+ keywords
@@ -873,10 +1166,30 @@ export default function Explorer() {
   const [dumpProgress, setDumpProgress]         = useState({ done: 0, total: 0 });
   const [dumpError, setDumpError]               = useState(null);
 
+  // Switching datasets resets everything that's dataset-scoped — a search
+  // string, filter selection, or open thread from one subreddit isn't
+  // meaningful applied to another.
+  const changeSubreddit = (id) => {
+    const next = SUBREDDITS.find(s => s.id === id);
+    if (!next) return;
+    setSubredditId(id);
+    setViewMode(next.viewModes[0]);
+    setActiveCategories(new Set(CATEGORIES));
+    setActivePostTypes(new Set(POST_TYPES));
+    setSearchQuery("");
+    setScoreSliderPos(0);
+    setSelectedPost(null);
+    setTooltip(null);
+    setDumpStatus("idle");
+  };
+
   // Slider position is mapped through a power curve (not linear) so that
   // most of the slider's range gives fine control over the low/typical
   // scores, since upvote counts are heavily right-skewed.
-  const maxScore = useMemo(() => Math.max(...allPosts.map(p => p.score)), [allPosts]);
+  const maxScore = useMemo(
+    () => (allPosts.length ? Math.max(...allPosts.map(p => p.score)) : 0),
+    [allPosts]
+  );
   const minScore = useMemo(() => {
     if (scoreSliderPos <= 0) return 0;
     const t = scoreSliderPos / 100;
@@ -895,12 +1208,6 @@ export default function Explorer() {
   const gRef    = useRef(null);
   const zoomRef = useRef(null);
 
-  const counts = useMemo(() => {
-    const c = {};
-    posts.forEach(p => { c[p.category] = (c[p.category]||0)+1; });
-    return c;
-  }, [posts]);
-
   const sortedCats = useMemo(() =>
     [...CATEGORIES].sort((a,b) => (CORPUS_COUNTS[b]||0) - (CORPUS_COUNTS[a]||0)),
   []);
@@ -911,6 +1218,14 @@ export default function Explorer() {
     const c = {};
     allPosts.forEach(p => { c[p.post_type] = (c[p.post_type]||0)+1; });
     return c;
+  }, [allPosts]);
+
+  // Quarters present in the full (unfiltered) corpus — a stable list, so
+  // buckets don't appear/disappear as the score slider moves. "unknown"
+  // (missing created_utc) is dropped rather than shown as a fake bucket.
+  const quarters = useMemo(() => {
+    const set = new Set(allPosts.map(p => p.quarter).filter(q => q && q !== "unknown"));
+    return [...set].sort();
   }, [allPosts]);
 
   // Parse search query into independent keyword-phrases.
@@ -942,13 +1257,16 @@ export default function Explorer() {
   const matchCount = matchingIds ? matchingIds.size : 0;
 
   // "Currently highlighted" = whatever's drawn at full/matched opacity right
-  // now: passes the score floor, its category/post-type is toggled on, and
-  // (if searching) it's in the match set. This is what Dump exports.
+  // now: passes the score floor, its category/post-type is toggled on (for
+  // modes that have a toggleable group; quarter has none, so always
+  // active), and (if searching) it's in the match set. This is what Dump
+  // exports.
   const visiblePosts = useMemo(() => {
     return posts.filter(p => {
-      const groupActive = viewMode === "category"
-        ? activeCategories.has(p.category)
-        : activePostTypes.has(p.post_type);
+      const groupActive =
+        viewMode === "category" ? activeCategories.has(p.category) :
+        viewMode === "move"     ? activePostTypes.has(p.post_type) :
+        true;
       if (!groupActive) return false;
       if (searching && !matchingIds.has(p.id)) return false;
       return true;
@@ -964,11 +1282,15 @@ export default function Explorer() {
     try {
       const markdown = await buildDumpMarkdown({
         posts: visiblePosts,
-        viewMode, keywords, searchScope, matchMode, minScore,
+        subredditLabel: activeSubreddit.label,
+        threadsPath: activeSubreddit.threadsPath,
+        viewMode, availableModes: activeSubreddit.viewModes,
+        keywords, searchScope, matchMode, minScore,
         activeCategories, activePostTypes,
         onProgress: (done, total) => setDumpProgress({ done, total }),
       });
-      downloadMarkdown(markdown, `returnToIndia-dump-${visiblePosts.length}-posts.md`);
+      const slug = activeSubreddit.id;
+      downloadMarkdown(markdown, `${slug}-dump-${visiblePosts.length}-posts.md`);
       setDumpStatus("done");
       setTimeout(() => setDumpStatus(s => s === "done" ? "idle" : s), 2500);
     } catch (err) {
@@ -1004,7 +1326,8 @@ export default function Explorer() {
     [posts, outerR]
   );
 
-  // Three fixed-position circles, left-to-right, one per move stage.
+  // Three fixed-position circles, left-to-right, one per move stage. Sized
+  // to fill the viewport since there are always exactly 3.
   const stageR = Math.min(VW / 6, VH * 0.42) * 0.88;
   const stageCenters = useMemo(() => {
     const c = {};
@@ -1013,52 +1336,100 @@ export default function Explorer() {
   }, [VW, cy]);
 
   const moveStageClusters = useMemo(
-    () => computeMoveStageLayout(posts, stageR),
+    () => computeBucketLayout(posts, MOVE_STAGES, "move_stage", stageR, "post_type", POST_TYPES),
     [posts, stageR]
   );
 
+  // Quarter timeline as a dot-histogram: narrow fixed-width columns (not
+  // sized by count, real bars don't get wider with more data, only
+  // taller), laid out left to right across a canvas that grows wider as
+  // quarter count grows, relying on the existing zoom/pan for navigation.
+  // Posts settle onto a shared floor via computeQuarterHistogram's force
+  // simulation rather than a circle pack, so column height reads as
+  // volume for that quarter.
+  const columnWidth = 60;
+  const columnGap   = 26;
+  const floorY = VH * 0.66;
+
+  const quarterCenters = useMemo(() => {
+    const c = {};
+    quarters.forEach((q, i) => { c[q] = (i + 0.5) * (columnWidth + columnGap); });
+    return c;
+  }, [quarters]);
+
+  const { clusters: quarterClusters, counts: quarterCounts } = useMemo(
+    () => computeQuarterHistogram(posts, quarters, quarterCenters, columnWidth, floorY),
+    [posts, quarters, quarterCenters, floorY]
+  );
+
   // ---------------------------------------------------------------------------
-  // D3 zoom
+  // D3 zoom — scaleExtent goes wider than [0.4,10] on the low end so a
+  // many-quarter timeline can still be zoomed out to fit entirely.
   // ---------------------------------------------------------------------------
   useEffect(() => {
     if (!svgRef.current || !gRef.current) return;
     const svg = d3.select(svgRef.current);
     const g   = d3.select(gRef.current);
     const zoom = d3.zoom()
-      .scaleExtent([0.4, 10])
+      .scaleExtent([0.05, 10])
       .on("zoom", (event) => { g.attr("transform", event.transform); });
     svg.call(zoom);
     zoomRef.current = zoom;
     return () => svg.on(".zoom", null);
   }, []);
 
-  const zoomToCategory = useCallback((cat) => {
+  const zoomToBounds = useCallback((x0, x1, y0, y1, padding = 30) => {
     if (!svgRef.current || !zoomRef.current) return;
+    x0 -= padding; x1 += padding; y0 -= padding; y1 += padding;
+    const scale = Math.min(10, Math.max(0.05, 0.88 / Math.max((x1-x0)/VW, (y1-y0)/VH)));
+    const tx = VW/2 - scale*(x0+x1)/2;
+    const ty = VH/2 - scale*(y0+y1)/2;
+    d3.select(svgRef.current).transition().duration(600)
+      .call(zoomRef.current.transform, d3.zoomIdentity.translate(tx,ty).scale(scale));
+  }, [VW, VH]);
+
+  const zoomToPoint = useCallback((centerX, centerY, radius, padding = 30) => {
+    zoomToBounds(centerX - radius, centerX + radius, centerY - radius, centerY + radius, padding);
+  }, [zoomToBounds]);
+
+  const zoomToCategory = useCallback((cat) => {
     const catCircles = clusters[cat];
     if (!catCircles?.length) return;
     const xs = catCircles.map(c => cx + c.x);
     const ys = catCircles.map(c => cy + c.y);
-    const x0 = Math.min(...xs) - 50, x1 = Math.max(...xs) + 50;
-    const y0 = Math.min(...ys) - 50, y1 = Math.max(...ys) + 50;
-    const scale = Math.min(10, 0.88 / Math.max((x1-x0)/VW, (y1-y0)/VH));
-    const tx = VW/2 - scale*(x0+x1)/2;
-    const ty = VH/2 - scale*(y0+y1)/2;
-    d3.select(svgRef.current).transition().duration(600)
-      .call(zoomRef.current.transform, d3.zoomIdentity.translate(tx,ty).scale(scale));
-  }, [clusters, cx, cy, VW, VH]);
+    const x0 = Math.min(...xs), x1 = Math.max(...xs);
+    const y0 = Math.min(...ys), y1 = Math.max(...ys);
+    zoomToPoint((x0+x1)/2, (y0+y1)/2, Math.max(x1-x0, y1-y0)/2, 50);
+  }, [clusters, cx, cy, zoomToPoint]);
 
   const zoomToStage = useCallback((stage) => {
-    if (!svgRef.current || !zoomRef.current) return;
     const center = stageCenters[stage];
     if (!center) return;
-    const x0 = center.x - stageR - 30, x1 = center.x + stageR + 30;
-    const y0 = center.y - stageR - 30, y1 = center.y + stageR + 30;
-    const scale = Math.min(10, 0.88 / Math.max((x1-x0)/VW, (y1-y0)/VH));
-    const tx = VW/2 - scale*(x0+x1)/2;
-    const ty = VH/2 - scale*(y0+y1)/2;
-    d3.select(svgRef.current).transition().duration(600)
-      .call(zoomRef.current.transform, d3.zoomIdentity.translate(tx,ty).scale(scale));
-  }, [stageCenters, stageR, VW, VH]);
+    zoomToPoint(center.x, center.y, stageR);
+  }, [stageCenters, stageR, zoomToPoint]);
+
+  // Quarter columns are tall and narrow, not square, so these use the
+  // actual stack extents (from the settled circle positions) rather than
+  // a fixed radius around a center point the way category/move-stage do.
+  const zoomToQuarter = useCallback((q) => {
+    const cx0 = quarterCenters[q];
+    if (cx0 === undefined) return;
+    const circles = quarterClusters[q] || [];
+    const halfWidth = columnWidth / 2;
+    const top = circles.length ? Math.min(...circles.map(c => c.y - c.r)) : floorY - 20;
+    zoomToBounds(cx0 - halfWidth, cx0 + halfWidth, top, floorY, 30);
+  }, [quarterCenters, quarterClusters, floorY, zoomToBounds]);
+
+  const zoomToFitQuarters = useCallback(() => {
+    if (!quarters.length) return;
+    const halfWidth = columnWidth / 2;
+    const xs = quarters.map(q => quarterCenters[q]);
+    let top = floorY;
+    quarters.forEach(q => {
+      (quarterClusters[q] || []).forEach(c => { top = Math.min(top, c.y - c.r); });
+    });
+    zoomToBounds(Math.min(...xs) - halfWidth, Math.max(...xs) + halfWidth, top, floorY, 40);
+  }, [quarters, quarterCenters, quarterClusters, floorY, zoomToBounds]);
 
   const resetZoom = useCallback(() => {
     if (!svgRef.current || !zoomRef.current) return;
@@ -1066,9 +1437,26 @@ export default function Explorer() {
       .call(zoomRef.current.transform, d3.zoomIdentity);
   }, []);
 
-  // The two view modes use unrelated coordinate layouts — carrying a zoom
-  // transform over from one to the other would land on an empty area.
-  useEffect(() => { resetZoom(); }, [viewMode, resetZoom]);
+  // Different view modes (and different subreddits) use unrelated
+  // coordinate layouts — carrying a zoom transform over from one to
+  // another would land on an empty area. Quarter mode fits the whole
+  // timeline instead of a hard reset, since a many-quarter dataset at
+  // zoomIdentity would only show its leftmost slice. Refs hold the latest
+  // callbacks without making them effect dependencies, so this only fires
+  // on an actual mode/dataset switch, not on every data recompute (e.g.
+  // moving the score slider recomputes quarterCenters too).
+  const zoomToFitQuartersRef = useRef(zoomToFitQuarters);
+  zoomToFitQuartersRef.current = zoomToFitQuarters;
+  const resetZoomRef = useRef(resetZoom);
+  resetZoomRef.current = resetZoom;
+
+  useEffect(() => {
+    if (viewMode === "quarter") {
+      zoomToFitQuartersRef.current();
+    } else {
+      resetZoomRef.current();
+    }
+  }, [viewMode, subredditId]);
 
   // ---------------------------------------------------------------------------
   // Circle appearance helpers — isActive is whatever group (category or
@@ -1083,6 +1471,10 @@ export default function Explorer() {
       : { fill: 0.06, stroke: 0 };
   }
 
+  const showViewModeToggle = activeSubreddit.viewModes.length > 1;
+  const showLegend = viewMode === "category" || viewMode === "move";
+  const showCovidLegend = viewMode === "quarter";
+
   return (
     <div style={{ width:"100vw", height:"100vh", background:"#F7F6F3", overflow:"hidden", position:"relative" }}>
 
@@ -1092,13 +1484,22 @@ export default function Explorer() {
         padding:"16px 28px", display:"flex", alignItems:"baseline", gap:12,
         zIndex:50, pointerEvents:"none",
       }}>
-        <h1 style={{ margin:0, fontSize:13, fontWeight:600, color:"#1A1A1A", fontFamily:"Inter,sans-serif", letterSpacing:"-0.01em" }}>
-          r/returnToIndia
-        </h1>
+        <SubredditSwitcher subreddits={SUBREDDITS} activeId={subredditId} onChange={changeSubreddit} />
         <span style={{ fontSize:11, color:"#CCC", fontFamily:"Inter,sans-serif" }}>
-          {posts.length.toLocaleString()} posts · circle size = engagement
+          {postsLoading ? "Loading…" : `${posts.length.toLocaleString()} posts · circle size = engagement`}
         </span>
       </div>
+
+      {postsErrorMsg && (
+        <div style={{
+          position:"fixed", top:"50%", left:"50%", transform:"translate(-50%,-50%)",
+          fontFamily:"Inter,sans-serif", fontSize:13, color:"#C4645A",
+          background:"#FAFAF8", border:"1px solid #E0DDD8", borderRadius:8,
+          padding:"14px 18px", zIndex:80,
+        }}>
+          Couldn't load {activeSubreddit.label}: {postsErrorMsg}
+        </div>
+      )}
 
       {/* Search bar — centered at top */}
       <SearchBar
@@ -1115,7 +1516,7 @@ export default function Explorer() {
 
       {/* Reset view button */}
       <button
-        onClick={resetZoom}
+        onClick={() => (viewMode === "quarter" ? zoomToFitQuarters() : resetZoom())}
         style={{
           position:"fixed", top:16, right:28,
           background:"none", border:"1px solid #E0DDD8",
@@ -1149,7 +1550,7 @@ export default function Explorer() {
         onClick={e => { if (e.target.tagName === "svg") setSelectedPost(null); }}
       >
         <g ref={gRef}>
-          {viewMode === "category" ? (
+          {viewMode === "category" && (
             <>
               {/* Outer boundary circle */}
               <circle cx={cx} cy={cy} r={outerR} fill="none" stroke="#E0DDD8" strokeWidth={1}/>
@@ -1225,7 +1626,9 @@ export default function Explorer() {
                 );
               })}
             </>
-          ) : (
+          )}
+
+          {viewMode === "move" && (
             <>
               {/* Move-stage clusters: pre (left), ambiguous (center), post (right) */}
               {MOVE_STAGES.map(stage => {
@@ -1300,11 +1703,91 @@ export default function Explorer() {
               })}
             </>
           )}
+
+          {viewMode === "quarter" && (
+            <>
+              {/* Time histogram: a shared baseline is the only fixed
+                  geometry — each quarter's "bar" is just its posts
+                  settled into a column above it, no drawn rectangle. */}
+              {quarters.length > 0 && (
+                <line
+                  x1={quarterCenters[quarters[0]] - columnWidth}
+                  x2={quarterCenters[quarters[quarters.length - 1]] + columnWidth}
+                  y1={floorY} y2={floorY}
+                  stroke="#E0DDD8" strokeWidth={1}
+                />
+              )}
+
+              {quarters.map(q => {
+                const qcx     = quarterCenters[q];
+                const circles = quarterClusters[q] || [];
+                const top     = circles.length ? Math.min(...circles.map(c => c.y - c.r)) : floorY;
+
+                return (
+                  <g key={q}>
+                    {circles.map((c, i) => {
+                      const { fill, stroke } = getCircleOpacity(true, c.post.id);
+                      const isMatch = searching && matchingIds.has(c.post.id);
+                      const color = quarterPostColor(c.post);
+
+                      return (
+                        <g key={i}>
+                          <circle
+                            cx={c.x} cy={c.y} r={c.r}
+                            fill={color} fillOpacity={fill}
+                            stroke={color} strokeWidth={0.5} strokeOpacity={stroke}
+                            style={{ cursor:"pointer" }}
+                            onMouseEnter={e => {
+                              e.target.setAttribute("fill-opacity", "0.95");
+                              setTooltip({ post: c.post, x: e.clientX, y: e.clientY });
+                            }}
+                            onMouseMove={e => setTooltip(prev => prev ? { ...prev, x: e.clientX, y: e.clientY } : null)}
+                            onMouseLeave={e => {
+                              e.target.setAttribute("fill-opacity", String(fill));
+                              setTooltip(null);
+                            }}
+                            onClick={e => {
+                              e.stopPropagation();
+                              setSelectedPost(c.post);
+                              setTooltip(null);
+                            }}
+                          />
+                          {/* Match ring */}
+                          {isMatch && (
+                            <circle
+                              cx={c.x} cy={c.y} r={c.r + 1.5}
+                              fill="none"
+                              stroke={color} strokeWidth={1.5} strokeOpacity={0.9}
+                              pointerEvents="none"
+                            />
+                          )}
+                        </g>
+                      );
+                    })}
+
+                    {/* Quarter label + post count */}
+                    <text
+                      x={qcx} y={top - 14}
+                      textAnchor="middle" dominantBaseline="central"
+                      fill="#000000" fillOpacity={0.8}
+                      fontSize={9} fontFamily="Inter,sans-serif"
+                      fontWeight={600} letterSpacing="0.05em"
+                      pointerEvents="all"
+                      style={{ cursor:"zoom-in" }}
+                      onClick={e => { e.stopPropagation(); zoomToQuarter(q); }}
+                    >
+                      {q} · {quarterCounts[q].toLocaleString()}
+                    </text>
+                  </g>
+                );
+              })}
+            </>
+          )}
         </g>
       </svg>
 
-      {/* Legend */}
-      {viewMode === "category" ? (
+      {/* Legend — only for view modes with a toggleable group (quarter has none) */}
+      {showLegend && (viewMode === "category" ? (
         <Legend
           title="Categories"
           items={sortedCats.map(cat => ({
@@ -1322,10 +1805,15 @@ export default function Explorer() {
           activeKeys={activePostTypes}
           onToggle={togglePostType}
         />
-      )}
+      ))}
 
-      {/* View mode toggle */}
-      <ViewModeToggle mode={viewMode} onChange={setViewMode} />
+      {/* Covid gradient legend — quarter view only */}
+      {showCovidLegend && <CovidLegend />}
+
+      {/* View mode toggle — hidden when the active subreddit only has one mode */}
+      {showViewModeToggle && (
+        <ViewModeToggle mode={viewMode} modes={activeSubreddit.viewModes} onChange={setViewMode} />
+      )}
 
       {/* Score slider */}
       <ScoreSlider
@@ -1343,6 +1831,7 @@ export default function Explorer() {
       {selectedPost && (
         <ThreadPanel
           post={selectedPost}
+          threadsPath={activeSubreddit.threadsPath}
           keywords={keywords}
           onClose={() => setSelectedPost(null)}
         />
