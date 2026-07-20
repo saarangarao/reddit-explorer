@@ -268,7 +268,13 @@ function computeBucketLayout(posts, buckets, bucketField, bucketR, subField, sub
 // regardless of count, which can't represent "how much" the way a
 // variable-height stack can.
 // ---------------------------------------------------------------------------
-function computeQuarterHistogram(posts, quarters, centerX, columnWidth, floorY) {
+// Async + chunked one quarter at a time, yielding to the browser after each
+// so (a) the main thread isn't blocked solid for the whole computation and
+// (b) onProgress can drive a visible progress bar rather than the UI just
+// freezing until it's all done. isStale() is checked between quarters so a
+// superseded call (e.g. the slider moved again before this one finished)
+// can bail out instead of racing a newer request to set state.
+async function computeQuarterHistogram(posts, quarters, centerX, columnWidth, floorY, onProgress, isStale) {
   const byQuarter = {};
   quarters.forEach(q => { byQuarter[q] = []; });
   posts.forEach(p => { if (byQuarter[p.quarter]) byQuarter[p.quarter].push(p); });
@@ -276,11 +282,18 @@ function computeQuarterHistogram(posts, quarters, centerX, columnWidth, floorY) 
   const clusters = {};
   const counts = {};
   const halfWidth = columnWidth / 2;
+  const totalPosts = posts.length;
+  let processedPosts = 0;
 
-  quarters.forEach(q => {
+  for (const q of quarters) {
+    if (isStale && isStale()) return null;
     const qPosts = byQuarter[q];
     counts[q] = qPosts.length;
-    if (!qPosts.length) { clusters[q] = []; return; }
+    if (!qPosts.length) {
+      clusters[q] = [];
+      onProgress && onProgress(totalPosts ? processedPosts / totalPosts : 1);
+      continue;
+    }
 
     const cx = centerX[q];
 
@@ -323,7 +336,14 @@ function computeQuarterHistogram(posts, quarters, centerX, columnWidth, floorY) 
     }
 
     clusters[q] = nodes.map(n => ({ x: n.x, y: n.y, r: n.r, post: n.post }));
-  });
+    processedPosts += qPosts.length;
+    onProgress && onProgress(totalPosts ? processedPosts / totalPosts : 1);
+
+    // Yield to the browser between quarters so a paint (the progress bar,
+    // or anything else) can actually happen instead of the whole timeline
+    // computing in one uninterrupted synchronous block.
+    await new Promise(resolve => requestAnimationFrame(resolve));
+  }
 
   return { clusters, counts };
 }
@@ -887,6 +907,37 @@ function Legend({ title, items, activeKeys, onToggle }) {
 }
 
 // ---------------------------------------------------------------------------
+// SimulationLoadingOverlay — reassures the user the quarter timeline's
+// force simulation is still settling rather than the app having hung,
+// since it's the one view whose layout isn't instant.
+// ---------------------------------------------------------------------------
+function SimulationLoadingOverlay({ progress }) {
+  const pct = Math.round(Math.min(1, Math.max(0, progress)) * 100);
+  return (
+    <div style={{
+      position:"fixed", top:"50%", left:"50%", transform:"translate(-50%,-50%)",
+      background:"#FAFAF8", border:"1px solid #E0DDD8", borderRadius:10,
+      padding:"18px 22px", zIndex:80, minWidth:220,
+      fontFamily:"Inter,sans-serif",
+      boxShadow:"0 4px 20px rgba(0,0,0,0.08)",
+    }}>
+      <p style={{ margin:"0 0 10px", fontSize:12, color:"#2C2C2C", textAlign:"center" }}>
+        Settling layout…
+      </p>
+      <div style={{ width:"100%", height:6, background:"#E0DDD8", borderRadius:3, overflow:"hidden" }}>
+        <div style={{
+          width:`${pct}%`, height:"100%", background:"#1A1A1A", borderRadius:3,
+          transition:"width 0.12s linear",
+        }}/>
+      </div>
+      <p style={{ margin:"8px 0 0", fontSize:10, color:"#CCC", textAlign:"center" }}>
+        {pct}%
+      </p>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // CovidLegend — explains the covid/post-covid gradient in quarter view.
 // ---------------------------------------------------------------------------
 function CovidLegend() {
@@ -1381,10 +1432,46 @@ export default function Explorer() {
     return c;
   }, [quarters]);
 
-  const { clusters: quarterClusters, counts: quarterCounts } = useMemo(() => {
-    if (viewMode !== "quarter") return { clusters: {}, counts: {} };
-    return computeQuarterHistogram(posts, quarters, quarterCenters, columnWidth, floorY);
-  }, [posts, quarters, quarterCenters, floorY, viewMode]);
+  // computeQuarterHistogram is async (it yields between quarters so the
+  // main thread isn't blocked and a progress bar can actually update), so
+  // it's driven from an effect + state rather than a plain useMemo.
+  // quarterLayoutReqRef guards against a superseded run (slider moved
+  // again, or the user left quarter view) clobbering a newer one's result.
+  const [quarterLayout, setQuarterLayout]                 = useState({ clusters: {}, counts: {} });
+  const [quarterLayoutProgress, setQuarterLayoutProgress] = useState(0);
+  const [quarterLayoutBusy, setQuarterLayoutBusy]         = useState(false);
+  const quarterLayoutReqRef = useRef(0);
+
+  useEffect(() => {
+    if (viewMode !== "quarter") return undefined;
+
+    const reqId = ++quarterLayoutReqRef.current;
+    // Delay showing the overlay briefly so a fast recompute (small filtered
+    // set, or a dataset with few quarters) doesn't flash it for no reason.
+    const showTimer = setTimeout(() => {
+      if (quarterLayoutReqRef.current === reqId) setQuarterLayoutBusy(true);
+    }, 150);
+    setQuarterLayoutProgress(0);
+
+    computeQuarterHistogram(
+      posts, quarters, quarterCenters, columnWidth, floorY,
+      (p) => { if (quarterLayoutReqRef.current === reqId) setQuarterLayoutProgress(p); },
+      () => quarterLayoutReqRef.current !== reqId,
+    ).then(result => {
+      if (quarterLayoutReqRef.current !== reqId || !result) return;
+      clearTimeout(showTimer);
+      setQuarterLayout(result);
+      setQuarterLayoutBusy(false);
+    });
+
+    return () => {
+      clearTimeout(showTimer);
+      quarterLayoutReqRef.current++; // invalidate this run's in-flight computation
+    };
+  }, [viewMode, posts, quarters, quarterCenters, floorY]);
+
+  const quarterClusters = quarterLayout.clusters;
+  const quarterCounts   = quarterLayout.counts;
 
   // ---------------------------------------------------------------------------
   // D3 zoom — scaleExtent goes wider than [0.4,10] on the low end so a
@@ -1523,6 +1610,10 @@ export default function Explorer() {
         }}>
           Couldn't load {activeSubreddit.label}: {postsErrorMsg}
         </div>
+      )}
+
+      {viewMode === "quarter" && quarterLayoutBusy && (
+        <SimulationLoadingOverlay progress={quarterLayoutProgress} />
       )}
 
       {/* Search bar — centered at top */}
@@ -1800,7 +1891,7 @@ export default function Explorer() {
                       style={{ cursor:"zoom-in" }}
                       onClick={e => { e.stopPropagation(); zoomToQuarter(q); }}
                     >
-                      {q} · {quarterCounts[q].toLocaleString()}
+                      {q} · {(quarterCounts[q] || 0).toLocaleString()}
                     </text>
                   </g>
                 );
