@@ -59,12 +59,6 @@ const CATEGORY_LABELS = {
   healthcare:"Healthcare", family:"Family",
 };
 
-const CORPUS_COUNTS = {
-  career:1195, finances:1155, logistics:332, relationships:221,
-  culture:211, other:151, legal:141, housing:123,
-  education:103, healthcare:88, family:83,
-};
-
 // ---------------------------------------------------------------------------
 // Second "slice of the cake": posts positioned by move_stage (pre/ambiguous/
 // post, left-to-right) and color-coded by post_type within each cluster.
@@ -274,6 +268,18 @@ function computeBucketLayout(posts, buckets, bucketField, bucketR, subField, sub
 // freezing until it's all done. isStale() is checked between quarters so a
 // superseded call (e.g. the slider moved again before this one finished)
 // can bail out instead of racing a newer request to set state.
+// Circle radius here must NOT be the dataset-wide engagement radius (8-44px,
+// scaled for the much roomier category/move-stage packs) — reusing it would
+// let a quarter's few outlier high-engagement posts blow past the grid's
+// ~12px row assumption and inflate that bar's height independent of its
+// post count, which is exactly the "900 posts shorter than 889" bug this
+// fixes. Instead each quarter recalibrates its own posts' radii to this
+// small fixed range (still ranked by relative engagement within that
+// quarter), so bar height is governed by count alone.
+const QUARTER_ROW_SIZE = 12;
+const QUARTER_MIN_R = 2.4;
+const QUARTER_MAX_R = 5.2; // leaves room for the collide force's +0.6 padding within a 12px row
+
 async function computeQuarterHistogram(posts, quarters, centerX, columnWidth, floorY, onProgress, isStale) {
   const byQuarter = {};
   quarters.forEach(q => { byQuarter[q] = []; });
@@ -297,16 +303,27 @@ async function computeQuarterHistogram(posts, quarters, centerX, columnWidth, fl
 
     const cx = centerX[q];
 
+    // Recalibrate this quarter's radii to the fixed small range the grid
+    // expects — still ranked by each post's relative engagement within
+    // this quarter (its most-engaged post gets QUARTER_MAX_R, its least
+    // gets QUARTER_MIN_R), just decoupled from the dataset-wide 8-44px
+    // scale so it can't distort this bar's height.
+    const engagementMin = Math.min(...qPosts.map(p => p.radius));
+    const engagementMax = Math.max(...qPosts.map(p => p.radius));
+    const engagementSpan = engagementMax - engagementMin || 1;
+    const barRadius = (p) =>
+      QUARTER_MIN_R + (QUARTER_MAX_R - QUARTER_MIN_R) * (p.radius - engagementMin) / engagementSpan;
+
     // Deterministic initial layout (rows stacked upward from the floor,
     // spread evenly across the column) rather than random jitter, so the
     // simulation converges quickly and consistently from a sane starting
     // point instead of untangling from noise.
-    const perRow = Math.max(1, Math.floor(columnWidth / 12));
+    const perRow = Math.max(1, Math.floor(columnWidth / QUARTER_ROW_SIZE));
     const nodes = qPosts.map((p, i) => ({
       post: p,
-      r: p.radius,
+      r: barRadius(p),
       x: cx + ((i % perRow) - (perRow - 1) / 2) * (columnWidth / perRow),
-      y: floorY - Math.floor(i / perRow) * 12 - 10,
+      y: floorY - Math.floor(i / perRow) * QUARTER_ROW_SIZE - 10,
     }));
 
     // alphaDecay is cranked well above d3's default (0.0228, tuned for
@@ -1283,12 +1300,23 @@ export default function Explorer() {
   const gRef    = useRef(null);
   const zoomRef = useRef(null);
 
+  // Full-corpus counts for the category legend — derived from the loaded
+  // dataset rather than hardcoded, so they can never drift out of sync with
+  // whatever posts_viz.json currently contains (previously a hand-copied
+  // CORPUS_COUNTS constant that silently went stale on every re-export).
+  // "Unfiltered" semantics: not affected by the score slider or search.
+  const categoryCounts = useMemo(() => {
+    const c = {};
+    allPosts.forEach(p => { c[p.category] = (c[p.category]||0)+1; });
+    return c;
+  }, [allPosts]);
+
   const sortedCats = useMemo(() =>
-    [...CATEGORIES].sort((a,b) => (CORPUS_COUNTS[b]||0) - (CORPUS_COUNTS[a]||0)),
-  []);
+    [...CATEGORIES].sort((a,b) => (categoryCounts[b]||0) - (categoryCounts[a]||0)),
+  [categoryCounts]);
 
   // Full-corpus counts for the post-type legend, same "unfiltered" semantics
-  // as CORPUS_COUNTS above (not affected by the score slider or search).
+  // as categoryCounts above (not affected by the score slider or search).
   const postTypeCounts = useMemo(() => {
     const c = {};
     allPosts.forEach(p => { c[p.post_type] = (c[p.post_type]||0)+1; });
@@ -1906,7 +1934,7 @@ export default function Explorer() {
         <Legend
           title="Categories"
           items={sortedCats.map(cat => ({
-            key: cat, label: CATEGORY_LABELS[cat], color: CATEGORY_COLORS[cat], count: CORPUS_COUNTS[cat],
+            key: cat, label: CATEGORY_LABELS[cat], color: CATEGORY_COLORS[cat], count: categoryCounts[cat],
           }))}
           activeKeys={activeCategories}
           onToggle={toggleCategory}
