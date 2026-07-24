@@ -4,33 +4,36 @@ import * as d3 from "d3";
 // ---------------------------------------------------------------------------
 // Subreddit registry — each dataset is fetched at runtime (not bundled), so
 // switching subreddits is just a re-fetch, no rebuild. viewModes lists which
-// clustering axes this dataset supports; "quarter" is universal (derived
-// purely from created_utc, every post has one regardless of subreddit),
-// "category"/"move" require compute_metrics.py's LLM/lexicon classification
-// and are currently only meaningful for r/returnToIndia.
+// clustering axes this dataset supports; "quarter" and "emotion" are both
+// universal per-post pipelines (created_utc and classify_emotion.py
+// respectively, run per-subreddit against its own DuckDB file), so once a
+// subreddit's data has been through them, "emotion" belongs in its
+// viewModes too. "category"/"move" require compute_metrics.py's LLM/
+// lexicon classification and are currently only
+// meaningful for r/returnToIndia.
 // ---------------------------------------------------------------------------
 const SUBREDDITS = [
   {
     id: "returntoindia", label: "r/returnToIndia",
     dataPath: "data/returntoindia/posts_viz.json",
     threadsPath: "data/returntoindia/threads",
-    viewModes: ["category", "move", "quarter"],
+    viewModes: ["category", "move", "quarter", "emotion"],
   },
   {
     id: "h1b", label: "r/h1b",
     dataPath: "data/h1b/posts_viz.json",
     threadsPath: "data/h1b/threads",
-    viewModes: ["quarter"],
+    viewModes: ["quarter", "emotion"],
   },
   {
     id: "usvisascheduling", label: "r/usvisascheduling",
     dataPath: "data/usvisascheduling/posts_viz.json",
     threadsPath: "data/usvisascheduling/threads",
-    viewModes: ["quarter"],
+    viewModes: ["quarter", "emotion"],
   },
 ];
 
-const VIEW_MODE_LABELS = { category: "By Category", move: "By Move Stage", quarter: "By Quarter" };
+const VIEW_MODE_LABELS = { category: "By Category", move: "By Move Stage", quarter: "By Quarter", emotion: "By Emotion" };
 
 const CATEGORIES = [
   "career","finances","logistics","relationships",
@@ -58,6 +61,84 @@ const CATEGORY_LABELS = {
   legal:"Legal", housing:"Housing", education:"Education",
   healthcare:"Healthcare", family:"Family",
 };
+
+// ---------------------------------------------------------------------------
+// Emotion "slice of the cake" — GoEmotions' full 28-label taxonomy (27
+// emotions + neutral), used as-is with no collapsing: classify_emotion.py
+// writes the model's raw top-scoring label straight to threads.emotion (an
+// earlier version collapsed rare labels into a per-family "nearest
+// representative," but that produced bad fits for broad families — e.g.
+// r/h1b's 12-member "joy" family folding amusement into gratitude just
+// because gratitude was more frequent, not because they're similar — so
+// it was retired). Unlike CATEGORIES, which is one fixed canonical set
+// (normalize_categories.py), which labels actually appear is still
+// corpus-dependent (not every subreddit's posts hit all 28), so the active
+// bucket list is derived live from the loaded data (see the `emotions`
+// memo), the same way `quarters` already is; these tables just cover every
+// possible label so whichever subset appears still renders consistently.
+// Colors are grouped by GoEmotions' own Ekman family so related emotions
+// read as visually related — reds for anger, blues for sadness, greens
+// for joy, etc.
+// ---------------------------------------------------------------------------
+const EMOTION_COLORS = {
+  // anger family — reds
+  anger:          "#BB5A56",
+  annoyance:      "#C97874",
+  disapproval:    "#D6928F",
+  // disgust family — olive/brown
+  disgust:        "#8A7B4F",
+  // fear family — purples
+  fear:           "#8B7BA8",
+  nervousness:    "#A896C4",
+  // joy family — greens
+  joy:            "#6B9E78",
+  amusement:      "#82AC8A",
+  approval:       "#99BA9C",
+  excitement:     "#5C9468",
+  admiration:     "#7FB07A",
+  caring:         "#93BD8E",
+  desire:         "#A6C79E",
+  optimism:       "#71A87F",
+  pride:          "#5E8F6C",
+  relief:         "#86AD8C",
+  gratitude:      "#4F8760",
+  love:           "#9AC4A0",
+  // sadness family — blues
+  sadness:        "#7EA8BE",
+  disappointment: "#6B96AC",
+  embarrassment:  "#95BBD0",
+  grief:          "#587F92",
+  remorse:        "#AACBDC",
+  // surprise family — oranges
+  surprise:       "#C4956A",
+  realization:    "#D6A97E",
+  confusion:      "#B37F4E",
+  curiosity:      "#E0BC98",
+  // neutral — same muted gray as category's "other"
+  neutral:        "#A8A49E",
+};
+
+const EMOTION_LABELS = {
+  admiration:"Admiration", amusement:"Amusement", anger:"Anger",
+  annoyance:"Annoyance", approval:"Approval", caring:"Caring",
+  confusion:"Confusion", curiosity:"Curiosity", desire:"Desire",
+  disappointment:"Disappointment", disapproval:"Disapproval", disgust:"Disgust",
+  embarrassment:"Embarrassment", excitement:"Excitement", fear:"Fear",
+  gratitude:"Gratitude", grief:"Grief", joy:"Joy", love:"Love",
+  nervousness:"Nervousness", optimism:"Optimism", pride:"Pride",
+  realization:"Realization", relief:"Relief", remorse:"Remorse",
+  sadness:"Sadness", surprise:"Surprise", neutral:"Neutral",
+};
+
+// curiosity and neutral are the expected baseline for a help-seeking
+// subreddit (most posts are literally someone asking a neutral question out
+// of curiosity), so they're uninformative as a "dominant emotion" summary.
+// Excluded ONLY from the quarter bars' top-2 badge (computeQuarterHistogram)
+// — everywhere else (By Emotion view/legend, dump breakdown) they're shown
+// like any other emotion, since a single post's own curiosity/neutral label
+// is still real, specific information about that post, just not an
+// interesting aggregate signal for "what stood out this quarter."
+const IGNORED_EMOTIONS = new Set(["curiosity", "neutral"]);
 
 // ---------------------------------------------------------------------------
 // Second "slice of the cake": posts positioned by move_stage (pre/ambiguous/
@@ -126,31 +207,34 @@ function matchesSearch(post, keywords, scope, mode) {
 }
 
 // ---------------------------------------------------------------------------
-// Pack layout — static, computed once
+// Pack layout — static, computed once. Generic over which field groups
+// posts into bubbles (category view passes CATEGORIES/'category'; emotion
+// view passes a dynamically-derived group list/'emotion', since unlike
+// CATEGORIES not every subreddit's posts hit all 28 possible emotions).
 // ---------------------------------------------------------------------------
-function computeLayout(posts, outerR) {
+function computeLayout(posts, outerR, groups, groupField) {
   // Same empty-children pitfall as below, but at the root: with zero posts
-  // (e.g. the async fetch hasn't resolved yet) every category is
+  // (e.g. the async fetch hasn't resolved yet) every group is
   // simultaneously empty, so root.children itself would be [], and
   // d3.hierarchy() would misread the whole root as a leaf with no parent —
   // "leaf.parent.data" then throws on null. Short-circuit before ever
   // building that tree.
-  if (!posts.length) return { clusters: {}, centroids: {} };
+  if (!posts.length || !groups.length) return { clusters: {}, centroids: {} };
 
-  const byCategory = {};
-  CATEGORIES.forEach(cat => { byCategory[cat] = []; });
-  posts.forEach(p => { if (byCategory[p.category]) byCategory[p.category].push(p); });
+  const byGroup = {};
+  groups.forEach(g => { byGroup[g] = []; });
+  posts.forEach(p => { if (byGroup[p[groupField]]) byGroup[p[groupField]].push(p); });
 
   // d3.hierarchy() treats a node whose children accessor returns an empty
   // array as a childless leaf (it never assigns `.children`), not as a
-  // pruned branch — so a category with 0 posts left after filtering must be
+  // pruned branch — so a group with 0 posts left after filtering must be
   // left out of the tree entirely, or its "leaf" gets misread as a post.
   const root = {
-    children: CATEGORIES
-      .filter(cat => byCategory[cat].length > 0)
-      .map(cat => ({
-        cat,
-        children: byCategory[cat].map(p => ({ post: p, r: p.radius, value: p.radius * p.radius })),
+    children: groups
+      .filter(g => byGroup[g].length > 0)
+      .map(g => ({
+        group: g,
+        children: byGroup[g].map(p => ({ post: p, r: p.radius, value: p.radius * p.radius })),
       })),
   };
 
@@ -168,11 +252,11 @@ function computeLayout(posts, outerR) {
   const offsetY = outerR;
 
   const clusters = {};
-  CATEGORIES.forEach(cat => { clusters[cat] = []; });
+  groups.forEach(g => { clusters[g] = []; });
 
   hierarchy.leaves().forEach(leaf => {
-    const cat = leaf.parent.data.cat;
-    clusters[cat].push({
+    const g = leaf.parent.data.group;
+    clusters[g].push({
       x: leaf.x - offsetX,
       y: leaf.y - offsetY,
       r: leaf.r,
@@ -181,9 +265,9 @@ function computeLayout(posts, outerR) {
   });
 
   const centroids = {};
-  Object.entries(clusters).forEach(([cat, circles]) => {
+  Object.entries(clusters).forEach(([g, circles]) => {
     if (!circles.length) return;
-    centroids[cat] = {
+    centroids[g] = {
       x: circles.reduce((s, c) => s + c.x, 0) / circles.length,
       y: circles.reduce((s, c) => s + c.y, 0) / circles.length,
     };
@@ -287,6 +371,7 @@ async function computeQuarterHistogram(posts, quarters, centerX, columnWidth, fl
 
   const clusters = {};
   const counts = {};
+  const topEmotions = {};
   const halfWidth = columnWidth / 2;
   const totalPosts = posts.length;
   let processedPosts = 0;
@@ -295,6 +380,23 @@ async function computeQuarterHistogram(posts, quarters, centerX, columnWidth, fl
     if (isStale && isStale()) return null;
     const qPosts = byQuarter[q];
     counts[q] = qPosts.length;
+
+    // Top 2 emotions for this quarter's badge overlay — cheap (one pass,
+    // independent of the physics sim below), so compute it unconditionally
+    // even for an empty/no-emotion-data quarter (topEmotions[q] just ends
+    // up []). Posts with no emotion classification (p.emotion null) are
+    // skipped rather than counted under a fake bucket, and curiosity/
+    // neutral are excluded as the uninformative baseline for a
+    // help-seeking subreddit (see IGNORED_EMOTIONS).
+    const emotionTally = {};
+    qPosts.forEach(p => {
+      if (p.emotion && !IGNORED_EMOTIONS.has(p.emotion)) emotionTally[p.emotion] = (emotionTally[p.emotion]||0) + 1;
+    });
+    topEmotions[q] = Object.entries(emotionTally)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 2)
+      .map(([emotion, count]) => ({ emotion, count, pct: qPosts.length ? count / qPosts.length : 0 }));
+
     if (!qPosts.length) {
       clusters[q] = [];
       onProgress && onProgress(totalPosts ? processedPosts / totalPosts : 1);
@@ -362,7 +464,7 @@ async function computeQuarterHistogram(posts, quarters, centerX, columnWidth, fl
     await new Promise(resolve => requestAnimationFrame(resolve));
   }
 
-  return { clusters, counts };
+  return { clusters, counts, topEmotions };
 }
 
 // ---------------------------------------------------------------------------
@@ -564,7 +666,7 @@ function renderPostMd(index, post, threadData) {
   return lines.join("\n");
 }
 
-function renderDumpHeader({ posts, subredditLabel, viewMode, availableModes, keywords, searchScope, matchMode, minScore, activeCategories, activePostTypes }) {
+function renderDumpHeader({ posts, subredditLabel, viewMode, availableModes, keywords, searchScope, matchMode, minScore, activeCategories, activePostTypes, activeEmotions }) {
   const lines = [];
   lines.push(`# ${subredditLabel} — Thread Dump`);
   lines.push("");
@@ -583,14 +685,19 @@ function renderDumpHeader({ posts, subredditLabel, viewMode, availableModes, key
   } else if (viewMode === "move" && availableModes.includes("move")) {
     const active = POST_TYPES.filter(t => activePostTypes.has(t));
     lines.push(`- **Active post types:** ${active.length === POST_TYPES.length ? "all" : active.map(t => POST_TYPE_LABELS[t]).join(", ") || "none"}`);
+  } else if (viewMode === "emotion" && availableModes.includes("emotion")) {
+    const present = [...new Set(posts.map(p => p.emotion).filter(Boolean))];
+    const active = present.filter(e => activeEmotions.has(e));
+    lines.push(`- **Active emotions:** ${active.length === present.length ? "all" : active.map(e => EMOTION_LABELS[e] || e).join(", ") || "none"}`);
   }
 
-  const catCounts = {}, stageCounts = {}, typeCounts = {}, quarterCounts = {};
+  const catCounts = {}, stageCounts = {}, typeCounts = {}, quarterCounts = {}, emoCounts = {};
   posts.forEach(p => {
     catCounts[p.category]     = (catCounts[p.category]||0) + 1;
     stageCounts[p.move_stage] = (stageCounts[p.move_stage]||0) + 1;
     typeCounts[p.post_type]   = (typeCounts[p.post_type]||0) + 1;
     quarterCounts[p.quarter]  = (quarterCounts[p.quarter]||0) + 1;
+    if (p.emotion) emoCounts[p.emotion] = (emoCounts[p.emotion]||0) + 1;
   });
 
   lines.push("");
@@ -604,6 +711,12 @@ function renderDumpHeader({ posts, subredditLabel, viewMode, availableModes, key
     lines.push(`**Move-stage breakdown:** ` + MOVE_STAGES.map(s => `${MOVE_STAGE_LABELS[s]}: ${stageCounts[s]||0}`).join(", "));
     lines.push(`**Post-type breakdown:** ` + POST_TYPES.map(t => `${POST_TYPE_LABELS[t]}: ${typeCounts[t]||0}`).join(", "));
   }
+  if (availableModes.includes("emotion")) {
+    lines.push(`**Emotion breakdown:** ` + Object.entries(emoCounts)
+      .sort((a, b) => b[1] - a[1])
+      .map(([k, v]) => `${EMOTION_LABELS[k] || k}: ${v}`)
+      .join(", "));
+  }
   lines.push(`**Quarter breakdown:** ` + Object.entries(quarterCounts)
     .sort((a, b) => a[0].localeCompare(b[0]))
     .map(([k, v]) => `${k}: ${v}`)
@@ -614,9 +727,9 @@ function renderDumpHeader({ posts, subredditLabel, viewMode, availableModes, key
   return lines.join("\n");
 }
 
-async function buildDumpMarkdown({ posts, subredditLabel, threadsPath, viewMode, availableModes, keywords, searchScope, matchMode, minScore, activeCategories, activePostTypes, onProgress }) {
+async function buildDumpMarkdown({ posts, subredditLabel, threadsPath, viewMode, availableModes, keywords, searchScope, matchMode, minScore, activeCategories, activePostTypes, activeEmotions, onProgress }) {
   const sorted = [...posts].sort((a, b) => b.score - a.score);
-  const header = renderDumpHeader({ posts: sorted, subredditLabel, viewMode, availableModes, keywords, searchScope, matchMode, minScore, activeCategories, activePostTypes });
+  const header = renderDumpHeader({ posts: sorted, subredditLabel, viewMode, availableModes, keywords, searchScope, matchMode, minScore, activeCategories, activePostTypes, activeEmotions });
 
   let done = 0;
   const total = sorted.length;
@@ -801,8 +914,19 @@ function ThreadPanel({ post, threadsPath, keywords, onClose }) {
 // ---------------------------------------------------------------------------
 // Tooltip
 // ---------------------------------------------------------------------------
-function Tooltip({ post, x, y }) {
-  const color = CATEGORY_COLORS[post.category] || CATEGORY_COLORS.other;
+// hasCategoryData = whether the active subreddit has real category
+// classification at all (r/returnToIndia does; h1b/usvisascheduling don't,
+// so their posts' category is always the meaningless "other" fallback
+// compute_metrics.py writes when threads.category is empty). Driven off
+// activeSubreddit.viewModes rather than post.category itself, since
+// "other" is ALSO a legitimate real category for r/returnToIndia and the
+// two cases aren't distinguishable from the string value alone.
+function Tooltip({ post, x, y, hasCategoryData }) {
+  const categoryColor = CATEGORY_COLORS[post.category] || CATEGORY_COLORS.other;
+  const categoryLabel = CATEGORY_LABELS[post.category] || post.category;
+  const emotionLabel  = post.emotion ? (EMOTION_LABELS[post.emotion] || post.emotion) : null;
+  const emotionColor  = EMOTION_COLORS[post.emotion] || EMOTION_COLORS.neutral;
+
   return (
     <div style={{
       position:"fixed",
@@ -814,9 +938,24 @@ function Tooltip({ post, x, y }) {
       boxShadow:"0 4px 16px rgba(0,0,0,0.08)",
       fontFamily:"Inter,sans-serif",
     }}>
-      <span style={{ fontSize:9, fontWeight:600, letterSpacing:"0.1em", textTransform:"uppercase", color, display:"block", marginBottom:4 }}>
-        {CATEGORY_LABELS[post.category] || post.category}
-      </span>
+      <div style={{ display:"flex", alignItems:"center", gap:7, marginBottom:4 }}>
+        {/* Real category (or its absence) always takes the primary slot;
+            emotion rides alongside it as a second tag when both exist, or
+            stands in alone when this subreddit has no category data. */}
+        {hasCategoryData && (
+          <span style={{ fontSize:9, fontWeight:600, letterSpacing:"0.1em", textTransform:"uppercase", color:categoryColor }}>
+            {categoryLabel}
+          </span>
+        )}
+        {hasCategoryData && emotionLabel && (
+          <span style={{ fontSize:9, color:"#DDD" }}>·</span>
+        )}
+        {emotionLabel && (
+          <span style={{ fontSize:9, fontWeight:600, letterSpacing:"0.1em", textTransform:"uppercase", color:emotionColor }}>
+            {emotionLabel}
+          </span>
+        )}
+      </div>
       <p style={{ margin:"0 0 6px", fontSize:12, color:"#1A1A1A", lineHeight:1.4, fontFamily:"Georgia,serif" }}>
         {post.title}
       </p>
@@ -875,10 +1014,9 @@ function Legend({ title, items, activeKeys, onToggle }) {
 
   return (
     <div style={{
-      position:"fixed", bottom:24, left:24,
       background:"#FAFAF8", border:"1px solid #E0DDD8",
       borderRadius:8, padding:"12px 14px",
-      fontFamily:"Inter,sans-serif", zIndex:50,
+      fontFamily:"Inter,sans-serif",
       minWidth:168,
       boxShadow:"0 2px 10px rgba(0,0,0,0.05)",
       transition:"all 0.2s ease",
@@ -900,22 +1038,27 @@ function Legend({ title, items, activeKeys, onToggle }) {
 
       {expanded && (
         <>
-          {items.map(item => {
-            const active = activeKeys.has(item.key);
-            return (
-              <div key={item.key} onClick={() => onToggle(item.key)} style={{
-                display:"flex", alignItems:"center", justifyContent:"space-between",
-                gap:7, marginBottom:5, cursor:"pointer",
-                opacity: active ? 1 : 0.28, transition:"opacity 0.15s",
-              }}>
-                <div style={{ display:"flex", alignItems:"center", gap:6 }}>
-                  <span style={{ width:6, height:6, borderRadius:"50%", background:item.color, flexShrink:0 }}/>
-                  <span style={{ fontSize:11, color:"#2C2C2C" }}>{item.label}</span>
+          {/* Scrolls rather than growing unbounded — the full 27+neutral
+              GoEmotions taxonomy (no collapsing) can mean 20+ rows for a
+              single subreddit, easily taller than the viewport. */}
+          <div style={{ maxHeight:"38vh", overflowY: items.length > 14 ? "auto" : "visible" }}>
+            {items.map(item => {
+              const active = activeKeys.has(item.key);
+              return (
+                <div key={item.key} onClick={() => onToggle(item.key)} style={{
+                  display:"flex", alignItems:"center", justifyContent:"space-between",
+                  gap:7, marginBottom:5, cursor:"pointer",
+                  opacity: active ? 1 : 0.28, transition:"opacity 0.15s",
+                }}>
+                  <div style={{ display:"flex", alignItems:"center", gap:6 }}>
+                    <span style={{ width:6, height:6, borderRadius:"50%", background:item.color, flexShrink:0 }}/>
+                    <span style={{ fontSize:11, color:"#2C2C2C" }}>{item.label}</span>
+                  </div>
+                  <span style={{ fontSize:10, color:"#CCC" }}>{item.count||0}</span>
                 </div>
-                <span style={{ fontSize:10, color:"#CCC" }}>{item.count||0}</span>
-              </div>
-            );
-          })}
+              );
+            })}
+          </div>
           <p style={{ margin:"9px 0 0", fontSize:15, color:"#000000", lineHeight:1.4 }}>Click to filter</p>
         </>
       )}
@@ -962,10 +1105,9 @@ function CovidLegend() {
 
   return (
     <div style={{
-      position:"fixed", bottom:24, left:24,
       background:"#FAFAF8", border:"1px solid #E0DDD8",
       borderRadius:8, padding:"12px 14px",
-      fontFamily:"Inter,sans-serif", zIndex:50,
+      fontFamily:"Inter,sans-serif",
       minWidth:168,
       boxShadow:"0 2px 10px rgba(0,0,0,0.05)",
       transition:"all 0.2s ease",
@@ -1012,11 +1154,10 @@ function CovidLegend() {
 function ViewModeToggle({ mode, modes, onChange }) {
   return (
     <div style={{
-      position:"fixed", top:46, left:28,
       display:"flex", background:"#FAFAF8", border:"1px solid #E0DDD8",
       borderRadius:7, overflow:"hidden",
       boxShadow:"0 2px 10px rgba(0,0,0,0.05)",
-      fontFamily:"Inter,sans-serif", zIndex:50,
+      fontFamily:"Inter,sans-serif",
     }}>
       {modes.map(m => (
         <button
@@ -1233,6 +1374,11 @@ export default function Explorer() {
   const [tooltip, setTooltip]                   = useState(null);
   const [activeCategories, setActiveCategories] = useState(new Set(CATEGORIES));
   const [activePostTypes, setActivePostTypes]   = useState(new Set(POST_TYPES));
+  // Unlike activeCategories/activePostTypes (seeded from fixed constants),
+  // the emotion bucket set is corpus-dependent (see EMOTION_COLORS' comment
+  // above), so it starts empty and is populated by the effect below once
+  // the `emotions` memo knows what's actually in the loaded dataset.
+  const [activeEmotions, setActiveEmotions]     = useState(new Set());
   const [viewMode, setViewMode]                 = useState(activeSubreddit.viewModes[0]);
   const [searchQuery, setSearchQuery]           = useState("");
   const [searchScope, setSearchScope]           = useState("thread"); // 'post' | 'thread'
@@ -1252,6 +1398,7 @@ export default function Explorer() {
     setViewMode(next.viewModes[0]);
     setActiveCategories(new Set(CATEGORIES));
     setActivePostTypes(new Set(POST_TYPES));
+    setActiveEmotions(new Set());
     setSearchQuery("");
     setScoreSliderPos(0);
     setDebouncedSliderPos(0);
@@ -1323,6 +1470,33 @@ export default function Explorer() {
     return c;
   }, [allPosts]);
 
+  // Full-corpus counts for the emotion legend, same "unfiltered" semantics.
+  // Posts with no emotion data (subreddit not yet run through
+  // classify_emotion.py) have p.emotion === null and are excluded, not
+  // counted under some fake bucket.
+  const emotionCounts = useMemo(() => {
+    const c = {};
+    allPosts.forEach(p => { if (p.emotion) c[p.emotion] = (c[p.emotion]||0)+1; });
+    return c;
+  }, [allPosts]);
+
+  // Emotion buckets present in this dataset, sorted by descending count.
+  // Unlike CATEGORIES (one fixed canonical set), this must be derived live
+  // — see EMOTION_COLORS' comment for why the surviving label set is
+  // corpus-dependent. Empty for a subreddit with no emotion data yet.
+  const emotions = useMemo(
+    () => Object.keys(emotionCounts)
+      .sort((a,b) => emotionCounts[b] - emotionCounts[a]),
+    [emotionCounts]
+  );
+
+  // activeEmotions can't be seeded synchronously like activeCategories
+  // (new Set(CATEGORIES)) since the bucket list isn't known until
+  // `emotions` above has been computed from the loaded dataset.
+  useEffect(() => {
+    setActiveEmotions(new Set(emotions));
+  }, [emotions]);
+
   // Quarters present in the full (unfiltered) corpus — a stable list, so
   // buckets don't appear/disappear as the score slider moves. "unknown"
   // (missing created_utc) is dropped rather than shown as a fake bucket.
@@ -1360,21 +1534,24 @@ export default function Explorer() {
   const matchCount = matchingIds ? matchingIds.size : 0;
 
   // "Currently highlighted" = whatever's drawn at full/matched opacity right
-  // now: passes the score floor, its category/post-type is toggled on (for
-  // modes that have a toggleable group; quarter has none, so always
-  // active), and (if searching) it's in the match set. This is what Dump
-  // exports.
+  // now: passes the score floor, its category/post-type/emotion is toggled
+  // on (quarter mode has no primary toggleable group, but the emotion
+  // legend still dims by emotion there too, with a pass-through for posts
+  // with no emotion data at all, matching the quarter render block), and
+  // (if searching) it's in the match set. This is what Dump exports.
   const visiblePosts = useMemo(() => {
     return posts.filter(p => {
       const groupActive =
         viewMode === "category" ? activeCategories.has(p.category) :
         viewMode === "move"     ? activePostTypes.has(p.post_type) :
+        viewMode === "emotion"  ? activeEmotions.has(p.emotion) :
+        viewMode === "quarter"  ? (!p.emotion || activeEmotions.has(p.emotion)) :
         true;
       if (!groupActive) return false;
       if (searching && !matchingIds.has(p.id)) return false;
       return true;
     });
-  }, [posts, viewMode, activeCategories, activePostTypes, searching, matchingIds]);
+  }, [posts, viewMode, activeCategories, activePostTypes, activeEmotions, searching, matchingIds]);
 
   const startDump = () => setDumpStatus("confirm");
   const cancelDump = () => { setDumpStatus("idle"); setDumpError(null); };
@@ -1389,7 +1566,7 @@ export default function Explorer() {
         threadsPath: activeSubreddit.threadsPath,
         viewMode, availableModes: activeSubreddit.viewModes,
         keywords, searchScope, matchMode, minScore,
-        activeCategories, activePostTypes,
+        activeCategories, activePostTypes, activeEmotions,
         onProgress: (done, total) => setDumpProgress({ done, total }),
       });
       const slug = activeSubreddit.id;
@@ -1418,6 +1595,14 @@ export default function Explorer() {
     });
   };
 
+  const toggleEmotion = (emo) => {
+    setActiveEmotions(prev => {
+      const next = new Set(prev);
+      next.has(emo) ? next.delete(emo) : next.add(emo);
+      return next;
+    });
+  };
+
   const VW = window.innerWidth;
   const VH = window.innerHeight;
   const outerR = Math.min(VW, VH) * 0.44;
@@ -1426,8 +1611,13 @@ export default function Explorer() {
 
   const { clusters, centroids } = useMemo(() => {
     if (viewMode !== "category") return { clusters: {}, centroids: {} };
-    return computeLayout(posts, outerR);
+    return computeLayout(posts, outerR, CATEGORIES, "category");
   }, [posts, outerR, viewMode]);
+
+  const { clusters: emotionClusters, centroids: emotionCentroids } = useMemo(() => {
+    if (viewMode !== "emotion") return { clusters: {}, centroids: {} };
+    return computeLayout(posts, outerR, emotions, "emotion");
+  }, [posts, outerR, viewMode, emotions]);
 
   // Three fixed-position circles, left-to-right, one per move stage. Sized
   // to fill the viewport since there are always exactly 3.
@@ -1465,7 +1655,7 @@ export default function Explorer() {
   // it's driven from an effect + state rather than a plain useMemo.
   // quarterLayoutReqRef guards against a superseded run (slider moved
   // again, or the user left quarter view) clobbering a newer one's result.
-  const [quarterLayout, setQuarterLayout]                 = useState({ clusters: {}, counts: {} });
+  const [quarterLayout, setQuarterLayout]                 = useState({ clusters: {}, counts: {}, topEmotions: {} });
   const [quarterLayoutProgress, setQuarterLayoutProgress] = useState(0);
   const [quarterLayoutBusy, setQuarterLayoutBusy]         = useState(false);
   const quarterLayoutReqRef = useRef(0);
@@ -1498,8 +1688,9 @@ export default function Explorer() {
     };
   }, [viewMode, posts, quarters, quarterCenters, floorY]);
 
-  const quarterClusters = quarterLayout.clusters;
-  const quarterCounts   = quarterLayout.counts;
+  const quarterClusters    = quarterLayout.clusters;
+  const quarterCounts      = quarterLayout.counts;
+  const quarterTopEmotions = quarterLayout.topEmotions;
 
   // ---------------------------------------------------------------------------
   // D3 zoom — scaleExtent goes wider than [0.4,10] on the low end so a
@@ -1540,6 +1731,16 @@ export default function Explorer() {
     const y0 = Math.min(...ys), y1 = Math.max(...ys);
     zoomToPoint((x0+x1)/2, (y0+y1)/2, Math.max(x1-x0, y1-y0)/2, 50);
   }, [clusters, cx, cy, zoomToPoint]);
+
+  const zoomToEmotion = useCallback((emo) => {
+    const emoCircles = emotionClusters[emo];
+    if (!emoCircles?.length) return;
+    const xs = emoCircles.map(c => cx + c.x);
+    const ys = emoCircles.map(c => cy + c.y);
+    const x0 = Math.min(...xs), x1 = Math.max(...xs);
+    const y0 = Math.min(...ys), y1 = Math.max(...ys);
+    zoomToPoint((x0+x1)/2, (y0+y1)/2, Math.max(x1-x0, y1-y0)/2, 50);
+  }, [emotionClusters, cx, cy, zoomToPoint]);
 
   const zoomToStage = useCallback((stage) => {
     const center = stageCenters[stage];
@@ -1611,7 +1812,7 @@ export default function Explorer() {
   }
 
   const showViewModeToggle = activeSubreddit.viewModes.length > 1;
-  const showLegend = viewMode === "category" || viewMode === "move";
+  const showLegend = viewMode === "category" || viewMode === "move" || viewMode === "emotion";
   const showCovidLegend = viewMode === "quarter";
 
   return (
@@ -1771,6 +1972,86 @@ export default function Explorer() {
             </>
           )}
 
+          {viewMode === "emotion" && (
+            <>
+              {/* Outer boundary circle */}
+              <circle cx={cx} cy={cy} r={outerR} fill="none" stroke="#E0DDD8" strokeWidth={1}/>
+
+              {/* Emotion clusters — bucket list is corpus-derived (see
+                  EMOTION_COLORS' comment), not a fixed constant like
+                  CATEGORIES, so iterate `emotions` rather than a static list. */}
+              {emotions.map(emo => {
+                const color     = EMOTION_COLORS[emo] || EMOTION_COLORS.neutral;
+                const circles   = emotionClusters[emo] || [];
+                const centroid  = emotionCentroids[emo];
+                const emoActive = activeEmotions.has(emo);
+                if (!circles.length) return null;
+
+                return (
+                  <g key={emo} transform={`translate(${cx}, ${cy})`}>
+                    {circles.map((c, i) => {
+                      const { fill, stroke } = getCircleOpacity(emoActive, c.post.id);
+                      const isMatch = searching && matchingIds.has(c.post.id) && emoActive;
+
+                      return (
+                        <g key={i}>
+                          <circle
+                            cx={c.x} cy={c.y} r={c.r}
+                            fill={color} fillOpacity={fill}
+                            stroke={color} strokeWidth={0.5} strokeOpacity={stroke}
+                            style={{ cursor: emoActive ? "pointer" : "default" }}
+                            onMouseEnter={e => {
+                              if (!emoActive) return;
+                              e.target.setAttribute("fill-opacity", "0.95");
+                              setTooltip({ post: c.post, x: e.clientX, y: e.clientY });
+                            }}
+                            onMouseMove={e => setTooltip(prev => prev ? { ...prev, x: e.clientX, y: e.clientY } : null)}
+                            onMouseLeave={e => {
+                              e.target.setAttribute("fill-opacity", String(fill));
+                              setTooltip(null);
+                            }}
+                            onClick={e => {
+                              if (!emoActive) return;
+                              e.stopPropagation();
+                              setSelectedPost(c.post);
+                              setTooltip(null);
+                            }}
+                          />
+                          {/* Match ring */}
+                          {isMatch && (
+                            <circle
+                              cx={c.x} cy={c.y} r={c.r + 1.5}
+                              fill="none"
+                              stroke={color} strokeWidth={1.5} strokeOpacity={0.9}
+                              pointerEvents="none"
+                            />
+                          )}
+                        </g>
+                      );
+                    })}
+
+                    {/* Emotion label */}
+                    {centroid && (
+                      <text
+                        x={centroid.x} y={centroid.y}
+                        textAnchor="middle" dominantBaseline="central"
+                        fill="#000000"
+                        fillOpacity={emoActive ? 0.8 : 0.1}
+                        fontSize={9} fontFamily="Inter,sans-serif"
+                        fontWeight={600} letterSpacing="0.1em"
+                        pointerEvents="all"
+                        style={{ cursor:"zoom-in" }}
+                        onClick={e => { e.stopPropagation(); zoomToEmotion(emo); }}
+                      >
+                        {(EMOTION_LABELS[emo] || emo).toUpperCase()}
+                      </text>
+                    )}
+                  </g>
+                );
+              })}
+            </>
+          )}
+
           {viewMode === "move" && (
             <>
               {/* Move-stage clusters: pre (left), ambiguous (center), post (right) */}
@@ -1869,8 +2150,13 @@ export default function Explorer() {
                 return (
                   <g key={q}>
                     {circles.map((c, i) => {
-                      const { fill, stroke } = getCircleOpacity(true, c.post.id);
-                      const isMatch = searching && matchingIds.has(c.post.id);
+                      // Posts with no emotion data always show at full
+                      // opacity: the emotion legend's filter only applies
+                      // to posts it actually has an opinion about.
+                      const postEmotion = c.post.emotion;
+                      const emoActive = !postEmotion || activeEmotions.has(postEmotion);
+                      const { fill, stroke } = getCircleOpacity(emoActive, c.post.id);
+                      const isMatch = searching && matchingIds.has(c.post.id) && emoActive;
                       const color = quarterPostColor(c.post);
 
                       return (
@@ -1879,8 +2165,9 @@ export default function Explorer() {
                             cx={c.x} cy={c.y} r={c.r}
                             fill={color} fillOpacity={fill}
                             stroke={color} strokeWidth={0.5} strokeOpacity={stroke}
-                            style={{ cursor:"pointer" }}
+                            style={{ cursor: emoActive ? "pointer" : "default" }}
                             onMouseEnter={e => {
+                              if (!emoActive) return;
                               e.target.setAttribute("fill-opacity", "0.95");
                               setTooltip({ post: c.post, x: e.clientX, y: e.clientY });
                             }}
@@ -1890,6 +2177,7 @@ export default function Explorer() {
                               setTooltip(null);
                             }}
                             onClick={e => {
+                              if (!emoActive) return;
                               e.stopPropagation();
                               setSelectedPost(c.post);
                               setTooltip(null);
@@ -1907,6 +2195,24 @@ export default function Explorer() {
                         </g>
                       );
                     })}
+
+                    {/* Top-2-emotion tags — plain black text, "Name XX%",
+                        most dominant closest to the quarter label. Renders
+                        nothing if this subreddit has no emotion data yet
+                        (topEmotions[q] is simply empty in that case, not a
+                        fake entry). */}
+                    {(quarterTopEmotions[q] || []).map((e, i) => (
+                      <text
+                        key={e.emotion}
+                        x={qcx} y={top - 24 - i * 10}
+                        textAnchor="middle" dominantBaseline="central"
+                        fill="#000000" fillOpacity={0.55}
+                        fontSize={8} fontFamily="Inter,sans-serif"
+                        fontWeight={500}
+                      >
+                        {`${EMOTION_LABELS[e.emotion] || e.emotion} ${Math.round(e.pct * 100)}%`}
+                      </text>
+                    ))}
 
                     {/* Quarter label + post count */}
                     <text
@@ -1929,34 +2235,67 @@ export default function Explorer() {
         </g>
       </svg>
 
-      {/* Legend — only for view modes with a toggleable group (quarter has none) */}
-      {showLegend && (viewMode === "category" ? (
-        <Legend
-          title="Categories"
-          items={sortedCats.map(cat => ({
-            key: cat, label: CATEGORY_LABELS[cat], color: CATEGORY_COLORS[cat], count: categoryCounts[cat],
-          }))}
-          activeKeys={activeCategories}
-          onToggle={toggleCategory}
-        />
-      ) : (
-        <Legend
-          title="Post Type"
-          items={POST_TYPES.map(pt => ({
-            key: pt, label: POST_TYPE_LABELS[pt], color: POST_TYPE_COLORS[pt], count: postTypeCounts[pt],
-          }))}
-          activeKeys={activePostTypes}
-          onToggle={togglePostType}
-        />
-      ))}
+      {/* Bottom-left stack: the view mode toggle sits on top of whatever
+          legend-like panel is showing below it (column layout, toggle
+          first in DOM order), so it never has to guess a fixed pixel
+          offset that only works for one panel's height. Quarter mode has
+          no toggleable group of its own, so it gets the covid-coloring
+          explainer plus the Emotions legend (the quarter bars already
+          surface top emotions per bar, so the full legend belongs here
+          too) instead of leaving that slot empty. */}
+      <div style={{
+        position:"fixed", bottom:24, left:24, zIndex:50,
+        display:"flex", flexDirection:"column", gap:8, alignItems:"flex-start",
+      }}>
+        {showViewModeToggle && (
+          <ViewModeToggle mode={viewMode} modes={activeSubreddit.viewModes} onChange={setViewMode} />
+        )}
 
-      {/* Covid gradient legend — quarter view only */}
-      {showCovidLegend && <CovidLegend />}
+        {showLegend && (viewMode === "category" ? (
+          <Legend
+            title="Categories"
+            items={sortedCats.map(cat => ({
+              key: cat, label: CATEGORY_LABELS[cat], color: CATEGORY_COLORS[cat], count: categoryCounts[cat],
+            }))}
+            activeKeys={activeCategories}
+            onToggle={toggleCategory}
+          />
+        ) : viewMode === "emotion" ? (
+          <Legend
+            title="Emotions"
+            items={emotions.map(emo => ({
+              key: emo, label: EMOTION_LABELS[emo] || emo, color: EMOTION_COLORS[emo] || EMOTION_COLORS.neutral, count: emotionCounts[emo],
+            }))}
+            activeKeys={activeEmotions}
+            onToggle={toggleEmotion}
+          />
+        ) : (
+          <Legend
+            title="Post Type"
+            items={POST_TYPES.map(pt => ({
+              key: pt, label: POST_TYPE_LABELS[pt], color: POST_TYPE_COLORS[pt], count: postTypeCounts[pt],
+            }))}
+            activeKeys={activePostTypes}
+            onToggle={togglePostType}
+          />
+        ))}
 
-      {/* View mode toggle — hidden when the active subreddit only has one mode */}
-      {showViewModeToggle && (
-        <ViewModeToggle mode={viewMode} modes={activeSubreddit.viewModes} onChange={setViewMode} />
-      )}
+        {showCovidLegend && (
+          <>
+            <CovidLegend />
+            {emotions.length > 0 && (
+              <Legend
+                title="Emotions"
+                items={emotions.map(emo => ({
+                  key: emo, label: EMOTION_LABELS[emo] || emo, color: EMOTION_COLORS[emo] || EMOTION_COLORS.neutral, count: emotionCounts[emo],
+                }))}
+                activeKeys={activeEmotions}
+                onToggle={toggleEmotion}
+              />
+            )}
+          </>
+        )}
+      </div>
 
       {/* Score slider */}
       <ScoreSlider
@@ -1968,7 +2307,12 @@ export default function Explorer() {
       />
 
       {/* Tooltip */}
-      {tooltip && <Tooltip post={tooltip.post} x={tooltip.x} y={tooltip.y} />}
+      {tooltip && (
+        <Tooltip
+          post={tooltip.post} x={tooltip.x} y={tooltip.y}
+          hasCategoryData={activeSubreddit.viewModes.includes("category")}
+        />
+      )}
 
       {/* Thread panel — passes keywords for highlighting */}
       {selectedPost && (
