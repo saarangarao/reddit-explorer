@@ -1909,6 +1909,24 @@ export default function Explorer() {
 
                 return (
                   <g key={cat} transform={`translate(${cx}, ${cy})`}>
+                    {/* Invisible click target for "zoom to category," painted
+                        before the circles so any circle overlapping it wins
+                        the hit-test (circle click priority); this element
+                        only catches clicks that land in gaps between posts. */}
+                    {centroid && (
+                      <text
+                        x={centroid.x} y={centroid.y}
+                        textAnchor="middle" dominantBaseline="central"
+                        fill="transparent"
+                        fontSize={9} fontWeight={600} letterSpacing="0.1em"
+                        pointerEvents="all"
+                        style={{ cursor:"zoom-in" }}
+                        onClick={e => { e.stopPropagation(); zoomToCategory(cat); }}
+                      >
+                        {CATEGORY_LABELS[cat].toUpperCase()}
+                      </text>
+                    )}
+
                     {circles.map((c, i) => {
                       const { fill, stroke } = getCircleOpacity(catActive, c.post.id);
                       const isMatch = searching && matchingIds.has(c.post.id) && catActive;
@@ -1950,7 +1968,10 @@ export default function Explorer() {
                       );
                     })}
 
-                    {/* Category label */}
+                    {/* Category label — visually on top (legible over the
+                        circles), but pointer-events none so it never
+                        intercepts clicks; the invisible copy above it in
+                        paint order handles zoom-to-category clicks. */}
                     {centroid && (
                       <text
                         x={centroid.x} y={centroid.y}
@@ -1959,9 +1980,7 @@ export default function Explorer() {
                         fillOpacity={catActive ? 0.8 : 0.1}
                         fontSize={9} fontFamily="Inter,sans-serif"
                         fontWeight={600} letterSpacing="0.1em"
-                        pointerEvents="all"
-                        style={{ cursor:"zoom-in" }}
-                        onClick={e => { e.stopPropagation(); zoomToCategory(cat); }}
+                        pointerEvents="none"
                       >
                         {CATEGORY_LABELS[cat].toUpperCase()}
                       </text>
@@ -1989,6 +2008,24 @@ export default function Explorer() {
 
                 return (
                   <g key={emo} transform={`translate(${cx}, ${cy})`}>
+                    {/* Invisible click target for "zoom to emotion," painted
+                        before the circles so any circle overlapping it wins
+                        the hit-test (circle click priority); this element
+                        only catches clicks that land in gaps between posts. */}
+                    {centroid && (
+                      <text
+                        x={centroid.x} y={centroid.y}
+                        textAnchor="middle" dominantBaseline="central"
+                        fill="transparent"
+                        fontSize={9} fontWeight={600} letterSpacing="0.1em"
+                        pointerEvents="all"
+                        style={{ cursor:"zoom-in" }}
+                        onClick={e => { e.stopPropagation(); zoomToEmotion(emo); }}
+                      >
+                        {(EMOTION_LABELS[emo] || emo).toUpperCase()}
+                      </text>
+                    )}
+
                     {circles.map((c, i) => {
                       const { fill, stroke } = getCircleOpacity(emoActive, c.post.id);
                       const isMatch = searching && matchingIds.has(c.post.id) && emoActive;
@@ -2030,7 +2067,10 @@ export default function Explorer() {
                       );
                     })}
 
-                    {/* Emotion label */}
+                    {/* Emotion label — visually on top (legible over the
+                        circles), but pointer-events none so it never
+                        intercepts clicks; the invisible copy above it in
+                        paint order handles zoom-to-emotion clicks. */}
                     {centroid && (
                       <text
                         x={centroid.x} y={centroid.y}
@@ -2039,9 +2079,7 @@ export default function Explorer() {
                         fillOpacity={emoActive ? 0.8 : 0.1}
                         fontSize={9} fontFamily="Inter,sans-serif"
                         fontWeight={600} letterSpacing="0.1em"
-                        pointerEvents="all"
-                        style={{ cursor:"zoom-in" }}
-                        onClick={e => { e.stopPropagation(); zoomToEmotion(emo); }}
+                        pointerEvents="none"
                       >
                         {(EMOTION_LABELS[emo] || emo).toUpperCase()}
                       </text>
